@@ -15,7 +15,7 @@ namespace MergeVideo
         public static void SplitSubtitleByTimeline(
             string mergedSubtitlePath,
             string outPattern, // ví dụ: "output Part {0:00}.srt"
-            List<double> splitTimes, // seconds, ví dụ: [0, 39600, 79200] cho 0h, 11h, 22h
+            List<double> splitTimes, // seconds, ví dụ: [0, 39600, 79200]
             string format // ".srt" hoặc ".vtt"
         )
         {
@@ -28,17 +28,14 @@ namespace MergeVideo
             for (int i = 0; i < partCount; i++)
                 partBuilders.Add(new List<string>());
 
-            // Xử lý từng cue
             if (format.Equals(".srt", StringComparison.OrdinalIgnoreCase))
             {
                 int idx = 0;
                 while (idx < lines.Length)
                 {
-                    // Đọc 1 block SRT
-                    int cueIdx = idx;
                     while (idx < lines.Length && string.IsNullOrWhiteSpace(lines[idx])) idx++;
                     if (idx >= lines.Length) break;
-                    var numLine = lines[idx++];
+                    var _ = lines[idx++]; // index line
                     if (idx >= lines.Length) break;
                     var timeLine = lines[idx++];
                     if (!TryParseSrtTimeline(timeLine, out var startMs, out var endMs))
@@ -49,14 +46,16 @@ namespace MergeVideo
                     if (idx < lines.Length && string.IsNullOrWhiteSpace(lines[idx])) idx++;
 
                     double startSec = startMs / 1000.0;
-                    // Tìm part phù hợp
                     for (int p = 0; p < partCount; p++)
                     {
                         if (startSec >= splitTimes[p] && startSec < splitTimes[p + 1])
                         {
-                            partBuilders[p].Add($"{partBuilders[p].Count + 1}");
-                            partBuilders[p].Add(FormatSrtTimeline((long)(startSec - splitTimes[p]) * 1000) + " --> " +
-                                                FormatSrtTimeline((long)(endMs - splitTimes[p] * 1000)));
+                            long offsetMs = (long)Math.Round(splitTimes[p] * 1000.0);
+                            long newStart = startMs - offsetMs;
+                            long newEnd = endMs - offsetMs;
+
+                            partBuilders[p].Add($"{partBuilders[p].Count / 4 + 1}");
+                            partBuilders[p].Add(FormatSrtTimeline(newStart) + " --> " + FormatSrtTimeline(newEnd));
                             partBuilders[p].AddRange(text);
                             partBuilders[p].Add("");
                             break;
@@ -66,7 +65,6 @@ namespace MergeVideo
             }
             else if (format.Equals(".vtt", StringComparison.OrdinalIgnoreCase))
             {
-                // Bỏ header
                 int idx = 0;
                 if (lines.Length > 0 && lines[0].Trim().Equals("WEBVTT", StringComparison.OrdinalIgnoreCase))
                     idx++;
@@ -77,7 +75,6 @@ namespace MergeVideo
                 }
                 while (idx < lines.Length)
                 {
-                    int cueStart = idx;
                     string? cueId = null;
                     if (idx + 1 < lines.Length && IsVttTimelineLine(lines[idx + 1]))
                     {
@@ -86,6 +83,7 @@ namespace MergeVideo
                     }
                     if (idx >= lines.Length) break;
                     if (!IsVttTimelineLine(lines[idx])) { idx++; continue; }
+
                     var timeLine = lines[idx++];
                     if (!TryParseVttTimeline(timeLine, out var startMs, out var endMs, out var tailAttrs))
                         continue;
@@ -99,10 +97,13 @@ namespace MergeVideo
                     {
                         if (startSec >= splitTimes[p] && startSec < splitTimes[p + 1])
                         {
+                            long offsetMs = (long)Math.Round(splitTimes[p] * 1000.0);
+                            long newStart = startMs - offsetMs;
+                            long newEnd = endMs - offsetMs;
+
                             if (!string.IsNullOrEmpty(cueId)) partBuilders[p].Add(cueId);
-                            partBuilders[p].Add(FormatVttTimeline((long)(startSec - splitTimes[p]) * 1000, tailAttrs) +
-                                                " --> " +
-                                                FormatVttTimeline((long)(endMs - splitTimes[p] * 1000), tailAttrs));
+                            partBuilders[p].Add(FormatVttTimeline(newStart, tailAttrs) + " --> " +
+                                                FormatVttTimeline(newEnd, tailAttrs));
                             partBuilders[p].AddRange(text);
                             partBuilders[p].Add("");
                             break;
@@ -119,10 +120,10 @@ namespace MergeVideo
             }
         }
 
-        // Các hàm phụ trợ lấy từ Program.cs
+        // ---- helpers (UPDATED regex to accept comma/dot & optional hours for VTT) ----
         private static bool TryParseSrtTimeline(string line, out long startMs, out long endMs)
         {
-            var m = Regex.Match(line.Trim(), @"^(?<A>\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(?<B>\d{2}:\d{2}:\d{2}[,.]\d{3})");
+            var m = Regex.Match(line.Trim(), @"^(?<A>\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(?<B>\d{2}:\d{2}:\d{2}[,\.]\d{3})");
             if (!m.Success) { startMs = endMs = 0; return false; }
             startMs = ParseHmsMs(m.Groups["A"].Value);
             endMs = ParseHmsMs(m.Groups["B"].Value);
@@ -144,23 +145,26 @@ namespace MergeVideo
             int MS = int.Parse(m.Groups["MS"].Value);
             return (int)(H * 3600000L + M * 60000L + S * 1000L + MS);
         }
+
         private static bool IsVttTimelineLine(string line)
-            => Regex.IsMatch(line.Trim(), @"^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}");
+            => Regex.IsMatch(line.Trim(), @"^(?:\d{2}:)?\d{2}:\d{2}[,\.]\d{3}\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[,\.]\d{3}");
+
         private static bool TryParseVttTimeline(string line, out long startMs, out long endMs, out string tailAttrs)
         {
             startMs = endMs = 0; tailAttrs = string.Empty;
-            var m = Regex.Match(line.Trim(), @"^(?<A>\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(?<B>\d{2}:\d{2}:\d{2}\.\d{3})(?<Tail>.*)$");
+            var m = Regex.Match(line.Trim(), @"^(?<A>(?:\d{2}:)?\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(?<B>(?:\d{2}:)?\d{2}:\d{2}[,\.]\d{3})(?<Tail>.*)$");
             if (!m.Success) return false;
-            startMs = ParseVttHmsMs(m.Groups["A"].Value);
-            endMs = ParseVttHmsMs(m.Groups["B"].Value);
+            startMs = ParseVttToMs(m.Groups["A"].Value);
+            endMs = ParseVttToMs(m.Groups["B"].Value);
             tailAttrs = m.Groups["Tail"].Value;
             return true;
         }
-        private static long ParseVttHmsMs(string h)
+        private static long ParseVttToMs(string ts)
         {
-            var m = Regex.Match(h, @"^(?<H>\d{2}):(?<M>\d{2}):(?<S>\d{2})\.(?<MS>\d{3})$");
+            ts = ts.Replace(',', '.');
+            var m = Regex.Match(ts, @"^(?:(?<H>\d{2}):)?(?<M>\d{2}):(?<S>\d{2})\.(?<MS>\d{3})$");
             if (!m.Success) return 0;
-            int H = int.Parse(m.Groups["H"].Value);
+            int H = m.Groups["H"].Success ? int.Parse(m.Groups["H"].Value) : 0;
             int M = int.Parse(m.Groups["M"].Value);
             int S = int.Parse(m.Groups["S"].Value);
             int MS = int.Parse(m.Groups["MS"].Value);
