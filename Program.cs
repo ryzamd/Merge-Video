@@ -5,16 +5,11 @@
 // - Interactive console mode when no args: loop Y/N
 // NOTE: EPPlus license init kept. No MKV muxing of subtitles (explicitly excluded).
 
-using System;
+using OfficeOpenXml; // EPPlus
 using System.Diagnostics;
 using System.Globalization;
-using System.IO;
-using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Collections.Generic;
-using System.Timers;
-using OfficeOpenXml; // EPPlus
 
 namespace MergeVideo
 {
@@ -123,12 +118,51 @@ namespace MergeVideo
             var renamer = new Renamer(cfg, work, logger, excel, opts);
             renamer.ScanAndRenameIfNeeded(parentFolder, renameState);
 
-            // 2) CONCAT VIDEOS
+            // 2) CONCAT VIDEOS (audio-safe)
             var parentName = Path.GetFileName(parentFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             var finalMkv = Path.Combine(work.Root, SanitizeFileName(parentName) + ".mkv");
-            Console.WriteLine("[2/5] Concatenating videos -> " + finalMkv);
-            var videoConcat = new VideoConcatenator(cfg, work, logger);
-            videoConcat.ConcatIfNeeded(finalMkv);
+            Console.WriteLine("[2/5] Concatenating videos (audio-safe) -> " + finalMkv);
+
+            // Lấy danh sách clip gốc trong work/videos theo đúng thứ tự số
+            var inputs = Directory.EnumerateFiles(work.VideosDir)
+                .Where(IsVideo)
+                .OrderBy(n => n, new NumericNameComparer())
+                .ToList();
+            if (inputs.Count == 0)
+            {
+                logger.Error("No videos found in work/videos to concatenate.");
+                return 2;
+            }
+
+            // Dùng class mới: copy video, encode audio -> AAC (fix lỗi mất tiếng khi codec audio khác nhau)
+            var opt = new AudioSafeConcatManager.Options(
+                workDir: work.Root,
+                outputFileName: SanitizeFileName(parentName) + ".mkv",
+                ffmpegPath: cfg.FfmpegPath,     // hoặc null nếu có trong PATH
+                ffprobePath: cfg.FfprobePath,   // nếu có field; nếu không, bỏ qua -> "ffprobe" từ PATH
+                segmentTimeSeconds: null,       // giữ BigMkvSplitter ở bước 4
+                audioCodec: "aac",
+                audioBitrateKbps: 192,
+                audioChannels: 2,
+                audioSampleRate: 48000,
+                selectiveNormalize: true,       // CHỈ encode khi cần
+                maxDegreeOfParallelism: 0       // 0 = auto theo CPU
+            );
+            var manager = new AudioSafeConcatManager(opt, s => Console.WriteLine(s));
+            manager.RunAsync(inputs).GetAwaiter().GetResult();
+
+            var normDir = Path.Combine(work.Root, "norm");
+            var normList = Directory.Exists(normDir)
+                ? Directory.EnumerateFiles(normDir, "*.norm.mkv")
+                    .OrderBy(n => n, new NumericNameComparer())
+                    .Select(Path.GetFullPath)
+                    .ToList()
+                : inputs.Select(Path.GetFullPath).ToList(); // fallback nếu norm chưa có (hiếm)
+
+            var manifest = Path.Combine(work.LogsDir, "concat_sources.txt");
+            File.WriteAllLines(manifest, normList, new UTF8Encoding(false));
+
+            // Giữ nguyên ghi timeline như trước (phục vụ kiểm tra/ghi log)
             TimelineHelper.WriteConcatTimelineWithOriginalNames(
                 work.LogsDir,
                 work.VideosDir,
@@ -157,7 +191,7 @@ namespace MergeVideo
         }
 
         // ---------------- Configuration & Constants ----------------
-        private static readonly string[] VideoExt = new[] {  ".mp4",".mkv",".m4v",".webm",".mov",".avi",".wmv",".ts" };
+        private static readonly string[] VideoExt = new[] { ".mp4", ".mkv", ".m4v", ".webm", ".mov", ".avi", ".wmv", ".ts" };
         private static readonly string[] SubExt = new[] { ".srt", ".vtt" /* extendable: .ass/.ssa requires different parser */ };
         private const double SplitThresholdHours = 12.0; // YouTube 12h limit
         private const double SplitChunkHours = 11.0;      // create parts of ~11h
@@ -298,6 +332,7 @@ namespace MergeVideo
         static int RunProcessWithProgress(
             ProcessStartInfo psi,
             Func<string, double?> tryParseProgress,
+            WorkDirs work,
             Action<string>? onLine = null,
             ConsoleProgressBar? bar = null)
         {
@@ -306,12 +341,19 @@ namespace MergeVideo
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
 
+            // Đảm bảo log nằm đúng thư mục logs
+            string logDir = work.LogsDir;
+            EnsureDir(logDir);
+            string logPath = Path.Combine(logDir, "ffmpeg-log.txt");
+            using var logWriter = new StreamWriter(logPath, append: true, Encoding.UTF8);
+
             using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
 
             p.OutputDataReceived += (_, e) =>
             {
                 if (e.Data is null) return;
                 var line = e.Data;
+                logWriter.WriteLine(line);
                 onLine?.Invoke(line);
                 var v = tryParseProgress(line);
                 if (v.HasValue) bar?.Report(v.Value);
@@ -320,6 +362,7 @@ namespace MergeVideo
             {
                 if (e.Data is null) return;
                 var line = e.Data;
+                logWriter.WriteLine(line);
                 onLine?.Invoke(line);
                 var v = tryParseProgress(line);
                 if (v.HasValue) bar?.Report(v.Value);
@@ -332,6 +375,7 @@ namespace MergeVideo
             bar?.Done();
             return p.ExitCode;
         }
+
 
         // ---------------- WorkDirs ----------------
         internal class WorkDirs
@@ -459,9 +503,18 @@ namespace MergeVideo
             {
                 var videoXlsx = Path.Combine(_logsDir, "rename-video.xlsx");
                 var subXlsx = Path.Combine(_logsDir, "rename-subtitle.xlsx");
-                _pkgVideo.SaveAs(new FileInfo(videoXlsx));
-                _pkgSub.SaveAs(new FileInfo(subXlsx));
+
+                // Có dữ liệu mới nếu lớn hơn dòng header (row = 2)
+                bool hasVideoRows = _rowV > 2;
+                bool hasSubRows = _rowS > 2;
+
+                if (hasVideoRows || !File.Exists(videoXlsx))
+                    _pkgVideo.SaveAs(new FileInfo(videoXlsx)); // ghi mới/ghi đè khi có data mới hoặc file chưa tồn tại
+
+                if (hasSubRows || !File.Exists(subXlsx))
+                    _pkgSub.SaveAs(new FileInfo(subXlsx));
             }
+
         }
 
         // ---------------- RenameState ----------------
@@ -686,7 +739,7 @@ namespace MergeVideo
                                 FileName = _cfg.FfmpegPath,
                                 Arguments = $"-hide_banner -y -i {Quote(src)} -map 0:v:0 -map 0:a:0? -sn -dn -c copy -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 {Quote(dst)}"
                             };
-                            int exitN = RunProcessWithProgress(psiN, _ => (double)done / Math.Max(1, videoFiles.Count), bar: null);
+                            int exitN = RunProcessWithProgress(psiN, _ => (double)done / Math.Max(1, videoFiles.Count), _work, bar: null);
                             if (exitN != 0) { _log.Warn($"normalize failed for '{src}', will use original"); dst = src; }
                         }
                         videoFiles[i] = dst;
@@ -715,7 +768,7 @@ namespace MergeVideo
                 var psi = new ProcessStartInfo
                 {
                     FileName = _cfg.FfmpegPath,
-                    Arguments = $"-hide_banner -f concat -safe 0 -i {Quote(listPath)} -map 0 -c copy -fflags +genpts -avoid_negative_ts make_zero -progress pipe:1 -nostats {Quote(finalMkv)}"
+                    Arguments = $"-hide_banner -f concat -safe 0 -i {Quote(listPath)} -map 0:v -map 0:a? -c copy -fflags +genpts -avoid_negative_ts make_zero -progress pipe:1 -nostats {Quote(finalMkv)}"
                 };
 
                 double totalUs = totalDurSec * 1_000_000.0;
@@ -735,7 +788,7 @@ namespace MergeVideo
                     return pct;
                 }
 
-                var exit = RunProcessWithProgress(psi, TryParseFfmpeg, bar: bar);
+                var exit = RunProcessWithProgress(psi, TryParseFfmpeg, _work, bar: bar);
                 if (exit != 0)
                 {
                     _log.Error("ffmpeg concat failed");
@@ -787,9 +840,7 @@ namespace MergeVideo
                     return;
                 }
 
-                var cntSrt = subs.Count(s => Path.GetExtension(s).Equals(".srt", StringComparison.OrdinalIgnoreCase));
-                var cntVtt = subs.Count(s => Path.GetExtension(s).Equals(".vtt", StringComparison.OrdinalIgnoreCase));
-                string targetExt = _opts.TargetFormatForced ?? (cntSrt >= cntVtt ? ".srt" : ".vtt");
+                string targetExt = ".srt";
 
                 var outPath = Path.Combine(_work.Root, SanitizeFileName(parentName) + targetExt);
                 if (File.Exists(outPath))
@@ -824,54 +875,54 @@ namespace MergeVideo
                     subs = convList.OrderBy(n => n, new NumericNameComparer()).ToList();
                 }
 
-                            // ✅ ĐỌC MANIFEST (nếu có), fallback về work/videos nếu không tìm thấy
-            var manifestPath = Path.Combine(_work.LogsDir, "concat_sources.txt");
-            List<string> segments;
-            if (File.Exists(manifestPath))
-            {
-                segments = File.ReadAllLines(manifestPath, Encoding.UTF8)
-                               .Where(File.Exists)
+                // ✅ ĐỌC MANIFEST (nếu có), fallback về work/videos nếu không tìm thấy
+                var manifestPath = Path.Combine(_work.LogsDir, "concat_sources.txt");
+                List<string> segments;
+                if (File.Exists(manifestPath))
+                {
+                    segments = File.ReadAllLines(manifestPath, Encoding.UTF8)
+                                   .Where(File.Exists)
+                                   .ToList();
+                }
+                else
+                {
+                    segments = Directory.EnumerateFiles(_work.VideosDir)
+                               .Where(IsVideo)
+                               .OrderBy(n => n, new NumericNameComparer())
                                .ToList();
-            }
-            else
-            {
-                segments = Directory.EnumerateFiles(_work.VideosDir)
-                           .Where(IsVideo)
-                           .OrderBy(n => n, new NumericNameComparer())
-                           .ToList();
-            }
+                }
 
-            if (segments.Count != subs.Count)
-            {
-                _log.Warn($"Subtitle count ({subs.Count}) != video count ({segments.Count}). We'll align best-effort by index.");
-            }
+                if (segments.Count != subs.Count)
+                {
+                    _log.Warn($"Subtitle count ({subs.Count}) != video count ({segments.Count}). We'll align best-effort by index.");
+                }
 
-            // ✅ offsetsMs dựa trên file trong manifest/segments
-            var offsetsMs = new List<long>();
-            long cumMs = 0;
-            for (int i = 0; i < segments.Count; i++)
-            {
-                offsetsMs.Add(cumMs);
+                // ✅ offsetsMs dựa trên file trong manifest/segments
+                var offsetsMs = new List<long>();
+                long cumMs = 0;
+                for (int i = 0; i < segments.Count; i++)
+                {
+                    offsetsMs.Add(cumMs);
+                    try
+                    {
+                        var durSec = GetVideoDurationSeconds(_cfg, segments[i]);
+                        cumMs += (long)Math.Round(durSec * 1000.0);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"ffprobe failed on '{segments[i]}': {ex.Message}. Using 0 offset increment.");
+                    }
+                }
+
+                // (Tuỳ chọn, KHÁ KHUYÊN DÙNG) Sanity check tổng thời lượng offsets vs file MKV cuối
                 try
                 {
-                    var durSec = GetVideoDurationSeconds(_cfg, segments[i]);
-                    cumMs += (long)Math.Round(durSec * 1000.0);
+                    var totalVidSec = GetVideoDurationSeconds(_cfg, finalMkv);
+                    var diff = Math.Abs((cumMs / 1000.0) - totalVidSec);
+                    if (diff > 3.0)
+                        _log.Warn($"[Sanity] Subtitle offsets sum {cumMs / 1000.0:F3}s != video {totalVidSec:F3}s (diff {diff:F3}s).");
                 }
-                catch (Exception ex)
-                {
-                    _log.Warn($"ffprobe failed on '{segments[i]}': {ex.Message}. Using 0 offset increment.");
-                }
-            }
-
-            // (Tuỳ chọn, KHÁ KHUYÊN DÙNG) Sanity check tổng thời lượng offsets vs file MKV cuối
-            try
-            {
-                var totalVidSec = GetVideoDurationSeconds(_cfg, finalMkv);
-                var diff = Math.Abs((cumMs / 1000.0) - totalVidSec);
-                if (diff > 3.0)
-                    _log.Warn($"[Sanity] Subtitle offsets sum {cumMs/1000.0:F3}s != video {totalVidSec:F3}s (diff {diff:F3}s).");
-            }
-            catch { /* ignore */ }
+                catch { /* ignore */ }
 
 
                 using var bar = new ConsoleProgressBar("Merge subs");
@@ -1145,7 +1196,7 @@ namespace MergeVideo
                         FileName = _cfg.FfmpegPath,
                         Arguments = $"-hide_banner -y -i {Quote(finalMkv)} -map 0 -c copy -fflags +genpts -avoid_negative_ts make_zero -progress pipe:1 -nostats {Quote(normalized)}"
                     };
-                    var exitNorm = RunProcessWithProgress(psiNorm, TryParseFfmpeg, bar: barNorm);
+                    var exitNorm = RunProcessWithProgress(psiNorm, TryParseFfmpeg, _work, bar: barNorm);
                     if (exitNorm != 0)
                     {
                         _log.Warn($"ffmpeg normalize failed (exit {exitNorm}). Will try to split original file.");
@@ -1172,7 +1223,7 @@ namespace MergeVideo
                         FileName = _cfg.FfmpegPath,
                         Arguments = $"-hide_banner -y -i {Quote(normalized)} -map 0 -c copy -f segment -segment_time {SplitChunkHours * 3600} -reset_timestamps 1 -progress pipe:1 -nostats {Quote(outPattern)}"
                     };
-                    var exitSeg = RunProcessWithProgress(psiSeg, TryParseFfmpeg2, bar: barSplit);
+                    var exitSeg = RunProcessWithProgress(psiSeg, TryParseFfmpeg2, _work, bar: barSplit);
                     if (exitSeg != 0)
                     {
                         _log.Error($"ffmpeg segment split failed (exit {exitSeg}).");
