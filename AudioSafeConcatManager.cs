@@ -275,7 +275,7 @@ namespace MergeVideo
         // Remux copy cho file đã đạt chuẩn (rất nhanh)
         private async Task RemuxCopyAsync(string input, string outputNormMkv, CancellationToken ct)
         {
-            var args = new StringBuilder()
+            var argsCopy = new StringBuilder()
                 .Append("-hide_banner -y ")
                 .Append($"-i {Q(input)} ")
                 .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
@@ -286,7 +286,46 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, ct);
+            try
+            {
+                await RunFfmpegAsync(argsCopy, _opt.WorkDir, input,ct);
+            }
+            catch (Exception ex) when (IsInvalidData(ex))
+            {
+                _log?.Invoke($"[Retry] Remux copy failed (InvalidData). Re-encode AUDIO for {Path.GetFileName(input)}");
+                TryDelete(outputNormMkv);
+
+                var argsAac = new StringBuilder()
+                    .Append("-hide_banner -y ")
+                    .Append("-v error -xerror ")                 // fail sớm, log rõ
+                    .Append("-analyzeduration 200M -probesize 200M ")
+                    .Append("-fflags +discardcorrupt+igndts ")   // bỏ gói hỏng, bỏ qua DTS méo
+                    .Append($"-i {Q(input)} ")
+                    .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
+                    .Append("-c:v copy ")
+                    .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
+                    .Append("-fflags +genpts ")
+                    .Append("-avoid_negative_ts make_zero ")
+                    .Append("-max_interleave_delta 0 ")
+                    .Append(Q(outputNormMkv))
+                    .ToString();
+
+                try
+                {
+                    await RunFfmpegAsync(argsAac, _opt.WorkDir, input, ct);
+                }
+                catch (Exception ex2) when (IsInvalidData(ex2))
+                {
+                    _log?.Invoke($"[Retry-2] Audio re-encode still failing. Hard transcode V+A for {Path.GetFileName(input)}");
+                    TryDelete(outputNormMkv);
+                    await HardTranscodeAsync(input, outputNormMkv, ct);
+                }
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
         // Encode audio về chuẩn (giữ nguyên video)
@@ -304,7 +343,41 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, ct);
+            try
+            {
+                await RunFfmpegAsync(args, _opt.WorkDir, input, ct);
+            }
+            catch (Exception ex) when (IsInvalidData(ex))
+            {
+                _log?.Invoke($"[Retry] Audio normalize failed (InvalidData). Ignore-corrupt and retry: {Path.GetFileName(input)}");
+                TryDelete(outputNormMkv);
+
+                var argsSafe = new StringBuilder()
+                    .Append("-hide_banner -y ")
+                    .Append("-v error -xerror ")
+                    .Append("-analyzeduration 200M -probesize 200M ")
+                    .Append("-fflags +discardcorrupt+igndts ")
+                    .Append($"-i {Q(input)} ")
+                    .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
+                    .Append("-c:v copy ")
+                    .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
+                    .Append("-fflags +genpts ")
+                    .Append("-avoid_negative_ts make_zero ")
+                    .Append("-max_interleave_delta 0 ")
+                    .Append(Q(outputNormMkv))
+                    .ToString();
+
+                try
+                {
+                    await RunFfmpegAsync(argsSafe, _opt.WorkDir, input, ct);
+                }
+                catch (Exception ex2) when (IsInvalidData(ex2))
+                {
+                    _log?.Invoke($"[Retry-2] Safe normalize still failing. Hard transcode V+A for {Path.GetFileName(input)}");
+                    TryDelete(outputNormMkv);
+                    await HardTranscodeAsync(input, outputNormMkv, ct);
+                }
+            }
         }
 
         // Trường hợp thiếu audio: thêm silent AAC chuẩn, bám theo độ dài video (-shortest)
@@ -324,7 +397,7 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, ct);
+            await RunFfmpegAsync(args, _opt.WorkDir, input, ct);
         }
 
         // Concat sau khi tất cả .norm.mkv đã đồng bộ → copy cả audio & video
@@ -342,7 +415,7 @@ namespace MergeVideo
                 .Append(Q(outputMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, ct);
+            await RunFfmpegAsync(args, _opt.WorkDir, videosTxtPath, ct);
         }
 
         private async Task SplitAsync(string inputMkv, string outputPattern, int segmentTimeSeconds, CancellationToken ct)
@@ -358,49 +431,60 @@ namespace MergeVideo
                 .Append(Q(outputPattern))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, ct);
+            await RunFfmpegAsync(args, _opt.WorkDir, inputMkv, ct);
         }
 
         // =================== Process helpers ===================
 
-        private async Task<int> RunFfmpegAsync(string arguments, string workingDir, CancellationToken ct)
+        private async Task<int> RunFfmpegAsync(string arguments, string workingDir, string? contextInput, CancellationToken ct)
         {
-            _log?.Invoke($"[FFmpeg] {_opt.FfmpegPath} {arguments}");
-            return await RunToolAsync(_opt.FfmpegPath, arguments, workingDir, ct);
-        }
+            // đảm bảo dừng ngay khi lỗi + log ngắn gọn chỉ mức error
+            if (!arguments.Contains("-loglevel"))
+                arguments = "-loglevel error -xerror " + arguments;
 
-        private async Task<(int exitCode, string stdout)> RunToolCaptureAsync(string fileName, string arguments, string workingDir, CancellationToken ct)
-        {
-            var psi = new ProcessStartInfo
+            var cmdShown = $"{_opt.FfmpegPath} {arguments}";
+            _log?.Invoke($"[FFmpeg] {cmdShown}");
+
+            var (code, _so, se) = await RunToolCaptureSplitAsync(_opt.FfmpegPath, arguments, workingDir, ct);
+
+            if (code != 0)
             {
-                FileName = fileName,
-                Arguments = arguments,
-                WorkingDirectory = workingDir,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
-                CreateNoWindow = true
-            };
+                var baseName = contextInput != null ? Path.GetFileName(contextInput) : "unknown";
+                var logPath = Path.Combine(workingDir, $"ffmpeg-error-{baseName}.log");
+                try
+                {
+                    File.WriteAllText(logPath,
+                        $"CMD : {cmdShown}{Environment.NewLine}" +
+                        $"INPUT: {contextInput}{Environment.NewLine}" +
+                        $"EXIT: {code} ({MapFfmpegExitCode(code)}){Environment.NewLine}{Environment.NewLine}" +
+                        se, new UTF8Encoding(false));
+                }
+                catch { /* best effort */ }
 
-            using var p = new Process { StartInfo = psi };
-            if (!p.Start()) throw new InvalidOperationException($"Cannot start {fileName}.");
-
-            using (ct.Register(() => { try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { } }))
-            {
-                var outTask = p.StandardOutput.ReadToEndAsync();
-                var errTask = p.StandardError.ReadToEndAsync();
-                await Task.WhenAll(p.WaitForExitAsync(ct), outTask, errTask).ConfigureAwait(false);
-                var combined = (outTask.Result ?? string.Empty) + (errTask.Result ?? string.Empty);
-                return (p.ExitCode, combined);
+                // ném exception có kèm vài dòng đầu của stderr để hiện lên console
+                var firstLines = string.Join(Environment.NewLine,
+                    (se ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Take(12));
+                throw new InvalidOperationException(
+                    $"{_opt.FfmpegPath} exited with code {code} ({MapFfmpegExitCode(code)}). File: {baseName}. See: {logPath}\n{firstLines}");
             }
+            return 0;
         }
 
-        private async Task<int> RunToolAsync(string fileName, string arguments, string workingDir, CancellationToken ct)
+        // Map một số mã hay gặp sang tên + mô tả chính thức
+        private static string MapFfmpegExitCode(int code)
         {
-            var (exit, _) = await RunToolCaptureAsync(fileName, arguments, workingDir, ct);
-            if (exit != 0) throw new InvalidOperationException($"{fileName} exited with code {exit}.");
-            return exit;
+            return code switch
+            {
+                -1094995529 => "AVERROR_INVALIDDATA – Invalid data found when processing input", // :contentReference[oaicite:3]{index=3}
+                -541478725 => "AVERROR_EOF – End of file",                                     // :contentReference[oaicite:4]{index=4}
+                -22 => "AVERROR(EINVAL) – Invalid argument",
+                -2 => "AVERROR(ENOENT) – No such file or directory",
+                -13 => "AVERROR(EACCES) – Permission denied",
+                -12 => "AVERROR(ENOMEM) – Out of memory",
+                _ => "Unknown AVERROR (see stderr)"
+            };
         }
+
 
         private async Task<(int exitCode, string stdout, string stderr)> RunToolCaptureSplitAsync(string fileName, string arguments, string workingDir, CancellationToken ct)
         {
@@ -415,15 +499,21 @@ namespace MergeVideo
                 CreateNoWindow = true
             };
 
-            using var p = new Process { StartInfo = psi };
-            if (!p.Start()) throw new InvalidOperationException($"Cannot start {fileName}.");
+            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var sbOut = new StringBuilder(); var sbErr = new StringBuilder();
 
-            using (ct.Register(() => { try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { } }))
+            p.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) sbOut.AppendLine(e.Data); };
+            p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) sbErr.AppendLine(e.Data); };
+            p.Exited += (_, __) => tcs.TrySetResult(p.ExitCode);
+
+            if (!p.Start()) throw new InvalidOperationException($"Cannot start {fileName}.");
+            p.BeginOutputReadLine(); p.BeginErrorReadLine();
+
+            using (ct.Register(() => { try { if (!p.HasExited) p.Kill(true); } catch { } }))
             {
-                var outTask = p.StandardOutput.ReadToEndAsync();
-                var errTask = p.StandardError.ReadToEndAsync();
-                await Task.WhenAll(p.WaitForExitAsync(ct), outTask, errTask).ConfigureAwait(false);
-                return (p.ExitCode, outTask.Result ?? string.Empty, errTask.Result ?? string.Empty);
+                var exit = await tcs.Task.ConfigureAwait(false);
+                return (exit, sbOut.ToString(), sbErr.ToString());
             }
         }
 
@@ -440,5 +530,28 @@ namespace MergeVideo
         }
 
         private static string Q(string p) => $"\"{p}\"";
+
+        private async Task HardTranscodeAsync(string input, string outputNormMkv, CancellationToken ct)
+        {
+            var args = new StringBuilder()
+                .Append("-hide_banner -y ")
+                .Append("-v error -xerror ")
+                .Append("-analyzeduration 400M -probesize 400M ")
+                .Append("-fflags +discardcorrupt+igndts+genpts ")
+                .Append($"-i {Q(input)} ")
+                .Append("-sn -dn ")
+                .Append("-map 0:v:0 -map 0:a:0? ")
+                .Append("-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p ")
+                .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
+                .Append("-shortest ")
+                .Append(Q(outputNormMkv));
+
+            await RunFfmpegAsync(args.ToString(), _opt.WorkDir, input, ct);
+        }
+
+
+        private static bool IsInvalidData(Exception ex)
+            => ex is InvalidOperationException ioe && ioe.Message.Contains("exited with code -1094995529"); // AVERROR_INVALIDDATA
+
     }
 }
