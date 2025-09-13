@@ -1,5 +1,4 @@
-// ---------------- NumericNameComparer ----------------
-using MergeVideo;
+using MergeVideo.Utilities;
 
 internal class NumericNameComparer : IComparer<string>
 {
@@ -10,8 +9,8 @@ internal class NumericNameComparer : IComparer<string>
         if (y == null) return 1;
 
         // Extract numeric prefix if present
-        int nx = Program.NumericPrefixOrDefault(Path.GetFileName(x)!);
-        int ny = Program.NumericPrefixOrDefault(Path.GetFileName(y)!);
+        int nx = Utils.NumericPrefixOrDefault(Path.GetFileName(x)!);
+        int ny = Utils.NumericPrefixOrDefault(Path.GetFileName(y)!);
 
         int cmp = nx.CompareTo(ny);
         if (cmp != 0) return cmp;

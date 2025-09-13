@@ -288,7 +288,7 @@ namespace MergeVideo
 
             try
             {
-                await RunFfmpegAsync(argsCopy, _opt.WorkDir, input,ct);
+                await RunFfmpegAsync(argsCopy, _opt.WorkDir, input, ct);
             }
             catch (Exception ex) when (IsInvalidData(ex))
             {
