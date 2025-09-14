@@ -1,7 +1,10 @@
-﻿using System.Diagnostics;
+﻿using MergeVideo.Models;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace MergeVideo
 {
@@ -288,7 +291,7 @@ namespace MergeVideo
 
             try
             {
-                await RunFfmpegAsync(argsCopy, _opt.WorkDir, input, ct);
+                await RunFfmpegWithProgressAsync(argsCopy, _opt.WorkDir, $"Remux {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
             }
             catch (Exception ex) when (IsInvalidData(ex))
             {
@@ -312,7 +315,7 @@ namespace MergeVideo
 
                 try
                 {
-                    await RunFfmpegAsync(argsAac, _opt.WorkDir, input, ct);
+                    await RunFfmpegWithProgressAsync(argsAac, _opt.WorkDir, $"Re-encode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
                 }
                 catch (Exception ex2) when (IsInvalidData(ex2))
                 {
@@ -345,7 +348,7 @@ namespace MergeVideo
 
             try
             {
-                await RunFfmpegAsync(args, _opt.WorkDir, input, ct);
+                await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Normalize {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct);
             }
             catch (Exception ex) when (IsInvalidData(ex))
             {
@@ -369,7 +372,7 @@ namespace MergeVideo
 
                 try
                 {
-                    await RunFfmpegAsync(argsSafe, _opt.WorkDir, input, ct);
+                    await RunFfmpegWithProgressAsync(argsSafe, _opt.WorkDir, $"Normalize(safe) {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct);
                 }
                 catch (Exception ex2) when (IsInvalidData(ex2))
                 {
@@ -397,7 +400,7 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, input, ct);
+            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Add silent {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
         }
 
         // Concat sau khi tất cả .norm.mkv đã đồng bộ → copy cả audio & video
@@ -415,7 +418,15 @@ namespace MergeVideo
                 .Append(Q(outputMkv))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, videosTxtPath, ct);
+            // tổng thời lượng = tổng duration các file trong videos.txt
+            double total = 0;
+            foreach (var f in ReadConcatList(videosTxtPath))
+                total += (await TryGetDurationSecondsAsync(f, ct)) ?? 0;
+
+            var exit = await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Concat → {Path.GetFileName(outputMkv)}", total, ct);
+
+            if (exit != 0)
+                throw new InvalidOperationException($"ffmpeg concat failed (exit={exit}).");
         }
 
         private async Task SplitAsync(string inputMkv, string outputPattern, int segmentTimeSeconds, CancellationToken ct)
@@ -435,6 +446,79 @@ namespace MergeVideo
         }
 
         // =================== Process helpers ===================
+
+        // Parse "time=HH:MM:SS.mmm" hoặc "time=MM:SS.mmm" từ log ffmpeg → giây
+        private static double? TryParseFfmpegTimeSeconds(string line)
+        {
+            var m = Regex.Match(line, @"time\s*=\s*(?<t>(?:\d{2}:)?\d{2}:\d{2}(?:[.,]\d{1,3})?)");
+            if (!m.Success) return null;
+            var t = m.Groups["t"].Value.Replace(',', '.');
+
+            // hh:mm:ss.fff hoặc mm:ss.fff
+            if (TimeSpan.TryParseExact(t, new[] { @"hh\:mm\:ss\.fff", @"mm\:ss\.fff", @"hh\:mm\:ss" },
+                                       CultureInfo.InvariantCulture, out var ts))
+                return ts.TotalSeconds;
+            return null;
+        }
+
+        // Lấy duration (giây) bằng ffprobe; trả về null nếu lỗi
+        private async Task<double?> TryGetDurationSecondsAsync(string path, CancellationToken ct)
+        {
+            var args = $"-v error -show_entries format=duration -of default=nk=1:nw=1 {Q(path)}";
+            var (exit, stdout, _stderr) = await RunToolCaptureSplitAsync(_opt.FfprobePath, args, _opt.WorkDir, ct);
+            if (exit != 0) return null;
+            if (double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var s)) return s;
+            return null;
+        }
+
+        // Chạy ffmpeg với progress bar (nếu biết tổng thời lượng). Log vào work/logs/ffmpeg-log.txt
+        private async Task<int> RunFfmpegWithProgressAsync(
+            string arguments, string workingDir, string label, double? totalSeconds, CancellationToken ct)
+        {
+            if (!arguments.Contains("-loglevel"))
+                arguments = "-loglevel error -xerror " + arguments;
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = _opt.FfmpegPath,
+                Arguments = arguments,
+                WorkingDirectory = workingDir,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            var work = WorkDirs.Prepare(_opt.WorkDir); // để ConsoleProgressBar biết logsDir
+            using var bar = new ConsoleProgressBar(label);
+            bar.Report(0, "Starting");
+
+            double tot = totalSeconds.GetValueOrDefault(0);
+            double? Parser(string line)
+            {
+                if (tot <= 0) return null;           // không có tổng → chỉ hiện spinner
+                var cur = TryParseFfmpegTimeSeconds(line);
+                return cur.HasValue ? Math.Min(1.0, Math.Max(0.0, cur.Value / tot)) : (double?)null;
+            }
+
+            // chạy đồng bộ trong task để tương thích async
+            int exit = await Task.Run(() =>
+                ConsoleProgressBar.RunProcessWithProgress(psi, Parser, work, onLine: null, bar: bar), ct);
+
+            return exit;
+        }
+
+        // Đọc danh sách file từ videos.txt (format: file 'C:\path\xxx.mkv')
+        private static IEnumerable<string> ReadConcatList(string videosTxtPath)
+        {
+            foreach (var raw in File.ReadAllLines(videosTxtPath))
+            {
+                var line = raw.Trim();
+                if (!line.StartsWith("file", StringComparison.OrdinalIgnoreCase)) continue;
+                var i1 = line.IndexOf('\''); var i2 = line.LastIndexOf('\'');
+                if (i1 >= 0 && i2 > i1) yield return line.Substring(i1 + 1, i2 - i1 - 1).Replace("''", "'");
+            }
+        }
 
         private async Task<int> RunFfmpegAsync(string arguments, string workingDir, string? contextInput, CancellationToken ct)
         {
@@ -544,14 +628,14 @@ namespace MergeVideo
                 .Append("-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p ")
                 .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
                 .Append("-shortest ")
-                .Append(Q(outputNormMkv));
+                .Append(Q(outputNormMkv))
+                .ToString();
 
-            await RunFfmpegAsync(args.ToString(), _opt.WorkDir, input, ct);
+            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Hard transcode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
         }
 
 
         private static bool IsInvalidData(Exception ex)
             => ex is InvalidOperationException ioe && ioe.Message.Contains("exited with code -1094995529"); // AVERROR_INVALIDDATA
-
     }
 }

@@ -15,9 +15,6 @@ namespace MergeVideo
 {
     internal static class Program
     {
-        // ====== New runtime options ======
-        public static readonly WorkDirs? _work;
-
         static int Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
@@ -111,51 +108,135 @@ namespace MergeVideo
             var renamer = new Renamer(cfg, work, logger, excel, opts);
             renamer.ScanAndRenameIfNeeded(parentFolder, renameState);
 
-            // 2) CONCAT VIDEOS (audio-safe)
+            // 2) CONCAT VIDEOS (audio-safe) + ưu tiên cache norm nếu có đủ
             var parentName = Path.GetFileName(parentFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            var finalMkv = Path.Combine(work.Root, Utils.SanitizeFileName(parentName) + ".mkv");
-            Console.WriteLine("[2/5] Concatenating videos (audio-safe) -> " + finalMkv);
+            Console.WriteLine("[2/5] Concatenating videos (audio-safe) ...");
 
             // Lấy danh sách clip gốc trong work/videos theo đúng thứ tự số
-            var inputs = Directory.EnumerateFiles(work.VideosDir)
+            var inputsOriginal = Directory.EnumerateFiles(work.VideosDir)
                 .Where(Utils.IsVideo)
                 .OrderBy(n => n, new NumericNameComparer())
                 .ToList();
-            if (inputs.Count == 0)
+            if (inputsOriginal.Count == 0)
             {
                 logger.Error("No videos found in work/videos to concatenate.");
                 return 2;
             }
 
-            // Dùng class mới: copy video, encode audio -> AAC (fix lỗi mất tiếng khi codec audio khác nhau)
-            var opt = new AudioSafeConcatManager.Options(
-                workDir: work.Root,
-                outputFileName: Utils.SanitizeFileName(parentName) + ".mkv",
-                ffmpegPath: cfg.FfmpegPath,     // hoặc null nếu có trong PATH
-                ffprobePath: cfg.FfprobePath,   // nếu có field; nếu không, bỏ qua -> "ffprobe" từ PATH
-                segmentTimeSeconds: null,       // giữ BigMkvSplitter ở bước 4
-                audioCodec: "aac",
-                audioBitrateKbps: 192,
-                audioChannels: 2,
-                audioSampleRate: 48000,
-                selectiveNormalize: true,       // CHỈ encode khi cần
-                maxDegreeOfParallelism: 0       // 0 = auto theo CPU
-            );
-            var manager = new AudioSafeConcatManager(opt, s => Console.WriteLine(s));
-            manager.RunAsync(inputs).GetAwaiter().GetResult();
+            // Kiểm tra/chuẩn hoá mapping video↔subtitle
+            if (!Utils.ValidateSubtitleMapping(work.SubsDir, inputsOriginal, opts, logger, out var subMap))
+                return 3;
 
+            // Thử dùng cache ./work/norm nếu đầy đủ
+            var inputsForConcat = inputsOriginal;
+            bool useNorm = false;
             var normDir = Path.Combine(work.Root, "norm");
-            var normList = Directory.Exists(normDir)
-                ? Directory.EnumerateFiles(normDir, "*.norm.mkv")
-                    .OrderBy(n => n, new NumericNameComparer())
-                    .Select(Path.GetFullPath)
-                    .ToList()
-                : inputs.Select(Path.GetFullPath).ToList(); // fallback nếu norm chưa có (hiếm)
+            if (Directory.Exists(normDir))
+            {
+                // build lookup theo base "001"
+                var normLookup = Directory.EnumerateFiles(normDir, "*.norm.mkv")
+                    .ToLookup(p =>
+                    {
+                        var bn = Path.GetFileNameWithoutExtension(p); // "001.norm"
+                        if (bn.EndsWith(".norm", StringComparison.OrdinalIgnoreCase)) bn = bn[..^5];
+                        return bn;
+                    }, StringComparer.OrdinalIgnoreCase);
 
-            var manifest = Path.Combine(work.LogsDir, "concat_sources.txt");
-            File.WriteAllLines(manifest, normList, new UTF8Encoding(false));
+                bool allPresent = inputsOriginal.All(v =>
+                    normLookup.Contains(Path.GetFileNameWithoutExtension(v)));
 
-            // Giữ nguyên ghi timeline như trước (phục vụ kiểm tra/ghi log)
+                if (allPresent)
+                {
+                    inputsForConcat = inputsOriginal.Select(v =>
+                    {
+                        var b = Path.GetFileNameWithoutExtension(v);
+                        return normLookup[b].OrderBy(x => x).First();
+                    }).ToList();
+
+                    useNorm = true;
+                    Console.WriteLine($"   - Using normalized cache from 'norm' ({inputsForConcat.Count} files) → concat with -c copy.");
+                }
+                else
+                {
+                    Console.WriteLine("   - 'norm' exists but is incomplete → will normalize as needed.");
+                }
+            }
+
+            // Tính tổng thời lượng theo inputsForConcat và chia nhóm <= 11h
+            double totalDurationSec = 0;
+            foreach (string file in inputsForConcat)
+            {
+                try { totalDurationSec += Utils.GetVideoDurationSeconds(cfg, file); }
+                catch (Exception ex) { logger.Warn($"ffprobe failed for {Path.GetFileName(file)}: {ex.Message}"); }
+            }
+
+            List<List<string>> videoGroups = new();
+            if (totalDurationSec <= Utils.SplitThresholdHours * 3600)
+            {
+                videoGroups.Add(inputsForConcat);
+            }
+            else
+            {
+                double MAX_SEGMENT_SEC = Utils.SplitChunkHours * 3600;
+                List<string> currentGroup = new(); double currentDur = 0;
+                foreach (string file in inputsForConcat)
+                {
+                    double dur = 0;
+                    try { dur = Utils.GetVideoDurationSeconds(cfg, file); } catch { }
+                    if (currentGroup.Count > 0 && currentDur + dur > MAX_SEGMENT_SEC)
+                    {
+                        videoGroups.Add(currentGroup);
+                        currentGroup = new List<string>(); currentDur = 0;
+                    }
+                    currentGroup.Add(file); currentDur += dur;
+                }
+                if (currentGroup.Count > 0) videoGroups.Add(currentGroup);
+            }
+
+            // Concat từng nhóm
+            int partNumber = 1;
+            foreach (var group in videoGroups)
+            {
+                string sanitizedName = Utils.SanitizeFileName(parentName);
+                string outputFileName = (videoGroups.Count == 1)
+                    ? sanitizedName + ".mkv"
+                    : $"{sanitizedName} - Part {partNumber:00}.mkv";
+                string outputPath = Path.Combine(work.Root, outputFileName);
+                Console.WriteLine($"   -> Creating {outputFileName}");
+
+                if (useNorm)
+                {
+                    // Dùng concat demuxer (-c copy) → không re-encode
+                    var exit = Utils.FfmpegConcatCopy(group, outputPath, cfg.FfmpegPath, msg => Console.WriteLine(msg));
+                    if (exit != 0)
+                    {
+                        logger.Error($"ffmpeg concat copy failed for {outputFileName} (exit={exit}).");
+                        return 4;
+                    }
+                }
+                else
+                {
+                    // Chuẩn hoá & concat theo pipeline hiện có
+                    var opt = new AudioSafeConcatManager.Options(
+                        workDir: work.Root,
+                        outputFileName: outputFileName,
+                        ffmpegPath: cfg.FfmpegPath,
+                        ffprobePath: cfg.FfprobePath,
+                        segmentTimeSeconds: null,
+                        audioCodec: "aac",
+                        audioBitrateKbps: 192,
+                        audioChannels: 2,
+                        audioSampleRate: 48000,
+                        selectiveNormalize: true
+                    );
+                    var manager = new AudioSafeConcatManager(opt, msg => Console.WriteLine(msg));
+                    manager.RunAsync(group).GetAwaiter().GetResult();
+                }
+
+                partNumber++;
+            }
+
+            // Ghi timeline
             TimelineHelper.WriteConcatTimelineWithOriginalNames(
                 work.LogsDir,
                 work.VideosDir,
@@ -163,21 +244,60 @@ namespace MergeVideo
                 path => Utils.GetVideoDurationSeconds(cfg, path)
             );
 
-            // 3) SUBTITLE MERGE (now supports auto-unify mixed SRT/VTT)
-            Console.WriteLine("[3/5] Building single subtitle file...");
-            var subMerger = new SubtitleMerger(cfg, work, logger, opts);
-            subMerger.MergeIfNeeded(finalMkv, parentName);
+            // 3) SUBTITLE MERGE (per-part; offset = tổng độ dài *video*)
+            Console.WriteLine("[3/4] Merging subtitles for each video part...");
+            partNumber = 1;
+            foreach (var group in videoGroups)
+            {
+                string sanitizedName = Utils.SanitizeFileName(parentName);
+                string subOutputPath = (videoGroups.Count == 1)
+                    ? Path.Combine(work.Root, sanitizedName + ".srt")
+                    : Path.Combine(work.Root, $"{sanitizedName} - Part {partNumber:00}.srt");
 
-            // 4) SPLIT IF >12h
-            Console.WriteLine("[4/5] Checking duration & splitting if > 12h...");
-            var splitter = new BigMkvSplitter(cfg, work, logger);
-            splitter.SplitIfNeeded(finalMkv, parentName);
+                // Nếu group không có sub nào (tuỳ Strict/OnMissing) thì bỏ qua
+                bool hasAnySub = group.Any(v =>
+                {
+                    var bn = Path.GetFileNameWithoutExtension(v);
+                    if (bn.EndsWith(".norm", StringComparison.OrdinalIgnoreCase)) bn = bn[..^5];
+                    return subMap.ContainsKey(bn);
+                });
+                if (!hasAnySub)
+                {
+                    Console.WriteLine($"   - No subtitles for Part {partNumber:00}; skipping subtitle merge.");
+                    partNumber++;
+                    continue;
+                }
 
-            // 5) DONE
-            Console.WriteLine("[5/5] Done. Outputs in: " + work.Root);
-            Console.WriteLine(" - Video: " + finalMkv + (File.Exists(finalMkv) ? " (exists)" : ""));
-            var outSub = subMerger.GetOutputSubtitlePath(parentName);
-            if (outSub != null && File.Exists(outSub)) Console.WriteLine(" - Subtitle: " + outSub);
+                Utils.MergeSubtitlesForGroupUsingVideoDurations(group, subMap, cfg, subOutputPath, logger);
+                Console.WriteLine($"   - Created subtitle: {Path.GetFileName(subOutputPath)}");
+                partNumber++;
+            }
+
+            // 4) DONE – list output files
+            Console.WriteLine("[4/4] Done. Outputs in: " + work.Root);
+            var allMkvs = Directory.GetFiles(work.Root, Utils.SanitizeFileName(parentName) + "*.mkv");
+            foreach (string file in allMkvs)
+                Console.WriteLine(" - Video: " + file + (File.Exists(file) ? " (exists)" : ""));
+            var allSrts = Directory.GetFiles(work.Root, Utils.SanitizeFileName(parentName) + "*.srt");
+            if (allSrts.Length > 0)
+            {
+                foreach (string file in allSrts)
+                    Console.WriteLine(" - Subtitle: " + file);
+            }
+
+            // Cleanup: delete work/videos để tiết kiệm dung lượng
+            try
+            {
+                if (Directory.Exists(work.VideosDir))
+                {
+                    Directory.Delete(work.VideosDir, recursive: true);
+                    Console.WriteLine("Cleaned up: " + work.VideosDir);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: failed to delete {work.VideosDir}: {ex.Message}");
+            }
 
             excel.FlushAndSave();
             return 0;
