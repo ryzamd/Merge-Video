@@ -1,328 +1,190 @@
-﻿using System.Diagnostics;
+﻿using Spectre.Console;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace MergeVideo
 {
-    sealed class ConsoleProgressBar : IDisposable
+    // Dùng Spectre.Console cho UI, giữ tên lớp cũ để không phải đổi callsite.
+    public sealed class ConsoleProgressBar : IDisposable
     {
-        // Global state management for all progress bars
-        private static readonly object GlobalLock = new();
-        private static readonly Dictionary<ConsoleProgressBar, BarState> ActiveBars = new();
-        private static int BaseRow = -1;
-        private static Timer? GlobalTimer;
-        private static int MaxRowUsed = -1;
+        // ===== Shim instance API (no-op) để tương thích nếu có chỗ còn 'new ConsoleProgressBar' =====
+        public ConsoleProgressBar(string label, int width = 40) { /* no-op */ }
+        public void Report(double pct01) { /* no-op */ }
+        public void Done() { /* no-op */ }
+        public void Dispose() { /* no-op */ }
 
-        // Individual bar state
-        private class BarState
-        {
-            public int Row { get; set; }
-            public double Progress { get; set; }
-            public string Label { get; set; }
-            public bool IsDisposed { get; set; }
-            public DateTime LastUpdate { get; set; }
+        // ======== Spectre helpers ========
+        static string E(string s) => Markup.Escape(s ?? string.Empty);
 
-            public BarState(string label, int row)
-            {
-                Label = label;
-                Row = row;
-                Progress = 0;
-                IsDisposed = false;
-                LastUpdate = DateTime.Now;
-            }
-        }
+        public static void WriteHeader(string header)
+            => AnsiConsole.MarkupLine($"[bold]{E(header)}[/]");
 
-        private readonly BarState _state;
-        private readonly int _width;
-        private bool _disposed;
+        public static void WriteStep(string text)
+            => AnsiConsole.MarkupLine($"-> {E(text)}");
 
-        public ConsoleProgressBar(string label, int width = 40)
-        {
-            Label = label ?? "Progress";
-            _width = Math.Max(10, Math.Min(width, 60)); // Clamp width
-
-            lock (GlobalLock)
-            {
-                // Initialize base row on first bar
-                if (BaseRow < 0)
-                {
-                    BaseRow = Console.CursorTop;
-                    Console.WriteLine(); // Reserve space
-                }
-
-                // Find next available row
-                int row = 0;
-                while (ActiveBars.Values.Any(b => b.Row == row && !b.IsDisposed))
-                    row++;
-
-                _state = new BarState(label!, row);
-                ActiveBars[this] = _state;
-                MaxRowUsed = Math.Max(MaxRowUsed, row);
-
-                // Ensure we have enough space
-                EnsureConsoleSpace(row);
-
-                // Start global timer if not running
-                if (GlobalTimer == null)
-                {
-                    GlobalTimer = new Timer(_ => UpdateAllBars(), null, 0, 100);
-                }
-            }
-        }
-
-        public string Label { get; }
-
-        public void Report(double pct)
-        {
-            if (_disposed) return;
-
-            pct = Math.Clamp(pct, 0, 1);
-            lock (GlobalLock)
-            {
-                if (_state != null)
-                {
-                    _state.Progress = pct;
-                    _state.LastUpdate = DateTime.Now;
-                }
-            }
-        }
-
-        public void Done()
-        {
-            if (_disposed) return;
-            Report(1.0);
-            Thread.Sleep(100); // Give timer a chance to render final state
-            Dispose();
-        }
-
-        public void Dispose()
-        {
-            if (_disposed) return;
-            _disposed = true;
-
-            lock (GlobalLock)
-            {
-                if (_state != null)
-                {
-                    _state.IsDisposed = true;
-
-                    // Clear the line
-                    try
-                    {
-                        var (currentLeft, currentTop) = Console.GetCursorPosition();
-                        int targetRow = BaseRow + _state.Row;
-
-                        if (targetRow < Console.BufferHeight)
-                        {
-                            Console.SetCursorPosition(0, targetRow);
-                            Console.Write(new string(' ', Console.BufferWidth - 1));
-                            Console.SetCursorPosition(currentLeft, currentTop);
-                        }
-                    }
-                    catch { /* Ignore console errors */ }
-                }
-
-                ActiveBars.Remove(this);
-
-                // Stop timer if no active bars
-                if (!ActiveBars.Any(kvp => !kvp.Value.IsDisposed))
-                {
-                    GlobalTimer?.Dispose();
-                    GlobalTimer = null;
-                }
-            }
-        }
-
-        private static void EnsureConsoleSpace(int row)
-        {
-            try
-            {
-                int neededRow = BaseRow + row + 1;
-                while (Console.CursorTop < neededRow)
-                {
-                    Console.WriteLine();
-                }
-            }
-            catch { /* Ignore console errors */ }
-        }
-
-        private static void UpdateAllBars()
-        {
-            lock (GlobalLock)
-            {
-                if (BaseRow < 0) return;
-
-                var (savedLeft, savedTop) = (0, 0);
-                try
-                {
-                    (savedLeft, savedTop) = Console.GetCursorPosition();
-                }
-                catch { return; }
-
-                foreach (var kvp in ActiveBars.ToList())
-                {
-                    var bar = kvp.Key;
-                    var state = kvp.Value;
-
-                    if (state.IsDisposed) continue;
-
-                    try
-                    {
-                        RenderBar(state, bar._width);
-                    }
-                    catch { /* Ignore render errors */ }
-                }
-
-                try
-                {
-                    Console.SetCursorPosition(savedLeft, savedTop);
-                }
-                catch { /* Ignore positioning errors */ }
-            }
-        }
-
-        private static void RenderBar(BarState state, int barWidth)
-        {
-            int targetRow = BaseRow + state.Row;
-            if (targetRow >= Console.BufferHeight) return;
-
-            // Build progress bar string
-            int filled = (int)Math.Round(state.Progress * barWidth);
-            string bar = new string('█', filled) + new string('░', barWidth - filled);
-            int percent = (int)Math.Round(state.Progress * 100);
-
-            // Truncate label if needed
-            int maxLabelLen = Console.BufferWidth - barWidth - 10; // Reserve space for bar and percentage
-            string label = state.Label;
-            if (label.Length > maxLabelLen && maxLabelLen > 3)
-                label = label.Substring(0, maxLabelLen - 3) + "...";
-
-            string line = $"{label} [{bar}] {percent,3}%";
-
-            // Ensure line fits console width
-            if (line.Length >= Console.BufferWidth)
-                line = line.Substring(0, Console.BufferWidth - 1);
-
-            // Pad to clear any previous content
-            line = line.PadRight(Math.Min(Console.BufferWidth - 1, 120));
-
-            Console.SetCursorPosition(0, targetRow);
-            Console.Write(line);
-        }
-
-        public static void ResetRegion()
-        {
-            lock (GlobalLock)
-            {
-                // Clear all active bars
-                foreach (var bar in ActiveBars.Keys.ToList())
-                {
-                    bar.Dispose();
-                }
-
-                ActiveBars.Clear();
-                BaseRow = -1;
-                MaxRowUsed = -1;
-
-                GlobalTimer?.Dispose();
-                GlobalTimer = null;
-
-                // Move cursor to next line
-                try
-                {
-                    Console.WriteLine();
-                }
-                catch { /* Ignore */ }
-            }
-        }
-
-        // Static runner for FFmpeg with progress tracking
-        public static int RunProcessWithProgress(
-            ProcessStartInfo psi,
-            Func<string, double?> tryParseProgress,
-            string logsRootDir,
+        // 1 thanh tổng theo đếm item (Normalize all)
+        public static Task RunSingleBarByCountAsync(
             string label,
-            Action<string>? onLine,
-            ConsoleProgressBar? bar)
+            int totalCount,
+            Func<Func<int, Task>, Task> work,
+            ConcurrentQueue<string>? logs = null)
         {
-            psi.UseShellExecute = false;
-            psi.RedirectStandardError = true;
-            psi.RedirectStandardOutput = true;
-            psi.CreateNoWindow = true;
-
-            var outputBuffer = new StringBuilder(64 * 1024);
-            var errorBuffer = new StringBuilder(64 * 1024);
-            object bufferLock = new();
-
-            bool ownsBar = false;
-            if (bar == null)
-            {
-                bar = new ConsoleProgressBar(label);
-                ownsBar = true;
-            }
-
-            try
-            {
-                using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-
-                process.OutputDataReceived += (_, e) =>
+            return AnsiConsole.Progress()
+                .AutoClear(false)
+                .HideCompleted(false)
+                .Columns(new ProgressColumn[]
                 {
-                    if (e.Data == null) return;
-                    lock (bufferLock) { outputBuffer.AppendLine(e.Data); }
-                    onLine?.Invoke(e.Data);
-                };
-
-                process.ErrorDataReceived += (_, e) =>
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                })
+                .StartAsync(async ctx =>
                 {
-                    if (e.Data == null) return;
-                    lock (bufferLock) { errorBuffer.AppendLine(e.Data); }
+                    var safe = string.IsNullOrWhiteSpace(label) ? " " : label; // Spectre cấm rỗng
+                    var task = ctx.AddTask(E(safe), maxValue: totalCount);
 
-                    var progress = tryParseProgress?.Invoke(e.Data);
-                    if (progress.HasValue)
+                    async Task Report(int done)
                     {
-                        bar.Report(progress.Value);
-                    }
-                };
-
-                process.Start();
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-                process.WaitForExit();
-
-                bar.Done();
-
-                // Log errors if process failed
-                if (process.ExitCode != 0 && !string.IsNullOrEmpty(logsRootDir))
-                {
-                    try
-                    {
-                        var logsDir = System.IO.Path.Combine(logsRootDir, "logs");
-                        System.IO.Directory.CreateDirectory(logsDir);
-
-                        var safeName = Regex.Replace(label ?? "process", @"[^A-Za-z0-9_.-]+", "_");
-                        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmssfff");
-                        var logPath = System.IO.Path.Combine(logsDir, $"error-{safeName}-{timestamp}.log");
-
-                        string logContent;
-                        lock (bufferLock)
+                        task.Value = Math.Clamp(done, 0, totalCount);
+                        // mỗi lần cập nhật tiến độ, xả log nếu có
+                        if (logs != null)
                         {
-                            logContent = $"Exit Code: {process.ExitCode}\n\n" +
-                                        $"=== STDOUT ===\n{outputBuffer}\n\n" +
-                                        $"=== STDERR ===\n{errorBuffer}";
+                            while (logs.TryDequeue(out var line))
+                                AnsiConsole.WriteLine(line);
                         }
-
-                        System.IO.File.WriteAllText(logPath, logContent, new UTF8Encoding(false));
+                        await Task.Yield();
                     }
-                    catch { /* Best effort logging */ }
-                }
 
-                return process.ExitCode;
-            }
-            finally
+                    // chạy công việc song song
+                    var workTask = work(Report);
+
+                    // vòng bơm log trong khi chờ work kết thúc
+                    while (!workTask.IsCompleted)
+                    {
+                        if (logs != null)
+                        {
+                            while (logs.TryDequeue(out var line))
+                                AnsiConsole.WriteLine(line);
+                        }
+                        await Task.WhenAny(workTask, Task.Delay(50));
+                    }
+                    await workTask;
+
+                    // xả nốt log còn lại
+                    if (logs != null)
+                    {
+                        while (logs.TryDequeue(out var line))
+                            AnsiConsole.WriteLine(line);
+                    }
+
+                    task.Value = task.MaxValue;
+                });
+        }
+
+        // Mỗi output một progress bar
+        public static async Task RunPerOutputBarsAsync<T>(
+            string groupHeader,
+            IEnumerable<T> outputs,
+            Func<T, string> title,                        // tên file hiển thị
+            Func<T, Func<double, Task>, Task> runner)     // runner(item, onPercent 0..100)
+        {
+            if (!string.IsNullOrWhiteSpace(groupHeader))
+                WriteHeader(groupHeader);
+
+            foreach (var item in outputs)
             {
-                if (ownsBar)
-                    bar.Dispose();
+                WriteStep($"Creating {title(item)}");
+
+                await AnsiConsole.Progress()
+                    .AutoClear(false)
+                    .HideCompleted(false)
+                    .Columns(new ProgressColumn[]
+                    {
+                        new TaskDescriptionColumn(),
+                        new ProgressBarColumn(),
+                        new PercentageColumn(),
+                    })
+                    .StartAsync(async ctx =>
+                    {
+                        var t = ctx.AddTask($"[dim]{E(title(item))}[/]", maxValue: 100);
+                        async Task OnPercent(double p)
+                        {
+                            t.Value = Math.Clamp(p, 0, 100);
+                            await Task.Yield();
+                        }
+                        await runner(item, OnPercent);
+                        t.Value = t.MaxValue;
+                    });
             }
+        }
+
+        // Chạy ffmpeg với -progress pipe:1/2 và gọi onPercent(0..100)
+        public static async Task RunFfmpegWithProgressAsync(
+            string ffmpegPath,
+            string ffmpegArgs,            // KHÔNG kèm -progress/-nostats
+            double totalDurationSec,
+            string workingDir,
+            Func<double, Task> onPercent) // 0..100
+        {
+            if (string.IsNullOrWhiteSpace(ffmpegPath))
+                ffmpegPath = "ffmpeg";
+
+            // ép output progress ra stdout
+            var args = $"-hide_banner -y -nostdin -nostats -progress pipe:1 {ffmpegArgs}";
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                Arguments = args,
+                WorkingDirectory = string.IsNullOrWhiteSpace(workingDir) ? Environment.CurrentDirectory : workingDir,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,   // progress
+                RedirectStandardError = true,    // để debug
+                CreateNoWindow = true,
+            };
+
+            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            p.OutputDataReceived += async (_, e) =>
+            {
+                if (string.IsNullOrEmpty(e.Data)) return;
+
+                // out_time_ms=123456789
+                if (e.Data.StartsWith("out_time_ms=", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (long.TryParse(e.Data.AsSpan("out_time_ms=".Length), out var us) && totalDurationSec > 0)
+                    {
+                        var sec = us / 1_000_000.0;
+                        var pct = Math.Min(100.0, (sec / totalDurationSec) * 100.0);
+                        await onPercent(pct);
+                    }
+                }
+                // out_time=HH:MM:SS.mmm
+                else if (e.Data.StartsWith("out_time=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var s = e.Data["out_time=".Length..].Trim();
+                    if (TimeSpan.TryParse(s, out var ts) && totalDurationSec > 0)
+                    {
+                        var pct = Math.Min(100.0, (ts.TotalSeconds / totalDurationSec) * 100.0);
+                        await onPercent(pct);
+                    }
+                }
+            };
+
+            p.ErrorDataReceived += (_, __) => { /* optional: log stderr */ };
+            p.Exited += (_, __) => tcs.TrySetResult(p.ExitCode);
+
+            if (!p.Start())
+                throw new InvalidOperationException("Cannot start ffmpeg.");
+
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+
+            var code = await tcs.Task.ConfigureAwait(false);
+            if (code != 0)
+                throw new InvalidOperationException($"ffmpeg exited with code {code}");
         }
     }
 }

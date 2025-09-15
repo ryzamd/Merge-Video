@@ -1,4 +1,5 @@
-﻿using MergeVideo.Models;
+﻿using Spectre.Console;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -8,65 +9,50 @@ using System.Text.RegularExpressions;
 
 namespace MergeVideo
 {
-    /// <summary>
-    /// Audio-safe pipeline:
-    /// - Probe audio bằng ffprobe để quyết định: remux (copy) hay normalize (encode AAC).
-    /// - Mặc định chuẩn đồng bộ: AAC-LC, 2ch, 48kHz.
-    /// - Với file thiếu audio: thêm silent audio đúng chuẩn.
-    /// - Sau đó concat với -c:v copy -c:a copy (nhanh).
-    /// </summary>
     public sealed class AudioSafeConcatManager
     {
         public sealed class Options
         {
             public Options(
                 string workDir,
-                string outputFileName,
+                string outputBaseName,         // ví dụ: "<CourseName>" (không kèm .mkv)
                 string? ffmpegPath = null,
                 string? ffprobePath = null,
-                int? segmentTimeSeconds = null,
+                double maxPartHours = 11.0,    // chia Part theo ngưỡng 11h
                 string audioCodec = "aac",
                 int audioBitrateKbps = 192,
                 int audioChannels = 2,
                 int audioSampleRate = 48000,
                 bool selectiveNormalize = true,
-                int maxDegreeOfParallelism = 0 // 0 => auto
+                int? degreeOfParallelism = null // null => CPU-1
             )
             {
                 WorkDir = workDir ?? throw new ArgumentNullException(nameof(workDir));
-                OutputFileName = outputFileName ?? throw new ArgumentNullException(nameof(outputFileName));
+                OutputBaseName = outputBaseName ?? throw new ArgumentNullException(nameof(outputBaseName));
                 FfmpegPath = string.IsNullOrWhiteSpace(ffmpegPath) ? "ffmpeg" : ffmpegPath!;
                 FfprobePath = string.IsNullOrWhiteSpace(ffprobePath) ? "ffprobe" : ffprobePath!;
-                SegmentTimeSeconds = (segmentTimeSeconds.HasValue && segmentTimeSeconds.Value > 0)
-                    ? segmentTimeSeconds
-                    : null;
+                MaxPartHours = Math.Max(0.1, maxPartHours);
 
-                // Audio standard
-                AudioCodec = audioCodec;                 // "aac"
-                AudioBitrateKbps = audioBitrateKbps;     // 192
-                AudioChannels = audioChannels;           // 2
-                AudioSampleRate = audioSampleRate;       // 48000
+                AudioCodec = audioCodec;
+                AudioBitrateKbps = audioBitrateKbps;
+                AudioChannels = audioChannels;
+                AudioSampleRate = audioSampleRate;
 
-                SelectiveNormalize = selectiveNormalize; // chỉ encode khi cần
-                MaxDegreeOfParallelism = maxDegreeOfParallelism <= 0
-                    ? Math.Max(1, Environment.ProcessorCount - 1)
-                    : maxDegreeOfParallelism;
+                SelectiveNormalize = selectiveNormalize;
+                DegreeOfParallelism = Math.Max(1, degreeOfParallelism ?? (Environment.ProcessorCount - 1));
             }
 
             public string WorkDir { get; }
-            public string OutputFileName { get; }
+            public string OutputBaseName { get; }
             public string FfmpegPath { get; }
             public string FfprobePath { get; }
-            public int? SegmentTimeSeconds { get; }
-
-            // Chuẩn audio
+            public double MaxPartHours { get; }
             public string AudioCodec { get; }
             public int AudioBitrateKbps { get; }
             public int AudioChannels { get; }
             public int AudioSampleRate { get; }
-
             public bool SelectiveNormalize { get; }
-            public int MaxDegreeOfParallelism { get; }
+            public int DegreeOfParallelism { get; }
         }
 
         private readonly Options _opt;
@@ -76,8 +62,10 @@ namespace MergeVideo
             _opt = options;
             _log = logger;
         }
+        public sealed record PartResult(string OutputPath, IReadOnlyList<string> Inputs);
 
-        public async Task<string> RunAsync(IEnumerable<string> inputFiles, CancellationToken ct = default)
+        // Trả về danh sách output .mkv (1 hoặc nhiều Part)
+        public async Task<List<PartResult>> RunAsync(IEnumerable<string> inputFiles, CancellationToken ct = default)
         {
             Directory.CreateDirectory(_opt.WorkDir);
             var normDir = Path.Combine(_opt.WorkDir, "norm");
@@ -86,97 +74,178 @@ namespace MergeVideo
             var inputs = inputFiles.ToList();
             if (inputs.Count == 0) throw new InvalidOperationException("No input files.");
 
-            // 1) Probe + chuẩn hoá có chọn lọc
-            _log?.Invoke($"[Probe] Checking audio compliance ({inputs.Count} files)...");
-            var normalized = new List<string>(inputs.Count);
+            // [2.1/4] Normalize all video .... (1 progress bar tổng)
+            ConsoleProgressBar.WriteHeader("[2.1/4] Normalize all video ....");
 
-            using var sem = new SemaphoreSlim(_opt.MaxDegreeOfParallelism);
-            var tasks = inputs.Select(async src =>
-            {
-                await sem.WaitAsync(ct);
-                try
+            var normLogs = new ConcurrentQueue<string>();
+
+            await ConsoleProgressBar.RunSingleBarByCountAsync(
+                label: "Normalize",
+                totalCount: inputs.Count,
+                work: async report =>
                 {
-                    var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
-                    var info = await ProbeAudioAsync(src, ct);
-                    var baseName = Path.GetFileName(src);
-                    using var bar = new ConsoleProgressBar($"Normalize {baseName}");
+                    using var sem = new SemaphoreSlim(_opt.DegreeOfParallelism);
+                    var done = 0;
 
-                    if (!_opt.SelectiveNormalize)
+                    var tasks = inputs.Select(async src =>
                     {
-                        // luôn encode audio (bản cũ)
-                        await NormalizeAudioAsync(src, dst, info, ct, bar);
-                    }
-                    else
-                    {
-                        switch (GetCompliance(info))
+                        await sem.WaitAsync(ct);
+                        try
                         {
-                            case AudioCompliance.Compliant:
-                                await RemuxCopyAsync(src, dst, ct, bar);
-                                _log?.Invoke($"[OK] {baseName} already compliant → remux copy.");
-                                break;
+                            var info = await ProbeAudioAsync(src, ct);
+                            var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
+                            var baseName = Path.GetFileName(src);
 
-                            case AudioCompliance.MissingAudio:
-                                await NormalizeAddSilentAsync(src, dst, ct, bar);
-                                _log?.Invoke($"[Fix] {baseName} has NO audio → add silent AAC.");
-                                break;
+                            if (!_opt.SelectiveNormalize)
+                            {
+                                normLogs.Enqueue($"[Fix] {baseName} non-compliant → AAC encode.");
+                                await EncodeAacAsync(src, dst, info, ct);
+                            }
+                            else
+                            {
+                                switch (GetCompliance(info))
+                                {
+                                    case AudioCompliance.Compliant:
+                                        normLogs.Enqueue($"[OK] {baseName} compliant → remux copy.");
+                                        await RemuxCopyAsync(src, dst, ct);
+                                        break;
 
-                            default:
-                                await NormalizeAudioAsync(src, dst, info, ct, bar);
-                                _log?.Invoke($"[Fix] {baseName} non-compliant → re-encode AAC.");
-                                break;
+                                    case AudioCompliance.MissingAudio:
+                                        normLogs.Enqueue($"[Fix] {baseName} missing audio → add silent + AAC encode.");
+                                        await AddSilentAsync(src, dst, ct);
+                                        break;
+
+                                    default:
+                                        normLogs.Enqueue($"[Fix] {baseName} non-compliant → AAC encode.");
+                                        await EncodeAacAsync(src, dst, info, ct);
+                                        break;
+                                }
+                            }
                         }
-                    }
+                        finally
+                        {
+                            Interlocked.Increment(ref done);
+                            await report(done);   // cập nhật % và xả log ngay trong Report()
+                            sem.Release();
+                        }
+                    });
 
-                    lock (normalized) normalized.Add(dst);
-                }
-                finally { sem.Release(); }
-            }).ToList();
+                    await Task.WhenAll(tasks);
+                },
+                logs: normLogs  // ✅ xả log ở ngay trong Progress.StartAsync
+            );
 
-            await Task.WhenAll(tasks);
+            // Build danh sách norm theo thứ tự tự nhiên (số)
+            var normFiles = Directory.EnumerateFiles(normDir, "*.norm.mkv")
+                .OrderBy(n => n, new NumericNameComparer())
+                .ToList();
 
-            // 2) videos.txt cho concat
-            var videosTxt = Path.Combine(_opt.WorkDir, "videos.txt");
-            WriteConcatList(normalized.OrderBy(n => n, StringComparer.CurrentCultureIgnoreCase), videosTxt);
+            // Chia nhóm ≤ MaxPartHours
+            var parts = BuildGroups(normFiles, _opt.MaxPartHours);
 
-            // 3) Concat: copy cả video và audio (vì mọi .norm.mkv đã đồng bộ)
-            
-            var finalMkv = Path.Combine(_opt.WorkDir, _opt.OutputFileName);
-            using var bar = new ConsoleProgressBar($"Final {finalMkv}");
-            await ConcatCopyAsync(videosTxt, finalMkv, ct, bar);
+            // [2.2/4] Concatening video:
+            await ConsoleProgressBar.RunPerOutputBarsAsync(
+                "[2.2/4] Concatening video:",
+                parts,
+                title: part => part.OutputName,
+                runner: async (part, onPercent) =>
+                {
+                    // Viết list concat
+                    var listPath = Path.Combine(_opt.WorkDir, $"concat_{part.Index:00}.txt");
+                    File.WriteAllLines(listPath, part.Inputs.Select(f => $"file '{f.Replace("'", "''")}'"), new UTF8Encoding(false));
 
-            // 4) Optional split
-            if (_opt.SegmentTimeSeconds is int seg && seg > 0)
+                    var args = $"-f concat -safe 0 -i \"{listPath}\" -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{part.OutputPath}\"";
+
+                    await ConsoleProgressBar.RunFfmpegWithProgressAsync(
+                        _opt.FfmpegPath,
+                        args,
+                        totalDurationSec: part.TotalDurationSec,
+                        workingDir: _opt.WorkDir,
+                        onPercent: onPercent
+                    );
+
+                    TryDeleteQuiet(listPath);
+                });
+
+            return parts.Select(p => new PartResult(p.OutputPath, p.Inputs)).ToList();
+        }
+
+        // ================= Normalize or Copy =================
+
+        private async Task NormalizeOrCopyAsync(string input, string outputNormMkv, AudioInfo info, CancellationToken ct)
+        {
+            if (!_opt.SelectiveNormalize)
             {
-                var pattern = Path.Combine(
-                    _opt.WorkDir,
-                    Path.GetFileNameWithoutExtension(_opt.OutputFileName) + " Part%02d.mkv"
-                );
-                await SplitAsync(finalMkv, pattern, seg, ct);
+                await EncodeAacAsync(input, outputNormMkv, info, ct);
+                return;
             }
 
-            return finalMkv;
+            switch (GetCompliance(info))
+            {
+                case AudioCompliance.Compliant:
+                    await RemuxCopyAsync(input, outputNormMkv, ct);
+                    _log?.Invoke($"[OK] {Path.GetFileName(input)} compliant → remux copy.");
+                    break;
+                case AudioCompliance.MissingAudio:
+                    await AddSilentAsync(input, outputNormMkv, ct);
+                    _log?.Invoke($"[Fix] {Path.GetFileName(input)} missing audio → add silent.");
+                    break;
+                default:
+                    await EncodeAacAsync(input, outputNormMkv, info, ct);
+                    _log?.Invoke($"[Fix] {Path.GetFileName(input)} non-compliant → AAC encode.");
+                    break;
+            }
         }
 
-        // =================== Probe & Compliance ===================
-
-        private enum AudioCompliance { Compliant, MissingAudio, NonCompliant }
-
-        private AudioCompliance GetCompliance(AudioInfo info)
+        private async Task RemuxCopyAsync(string input, string output, CancellationToken ct)
         {
-            if (!info.HasAudio) return AudioCompliance.MissingAudio;
-
-            var codecOk = string.Equals(info.CodecName, _opt.AudioCodec, StringComparison.OrdinalIgnoreCase);
-            var chOk = info.Channels == _opt.AudioChannels;
-            var rateOk = info.SampleRate == _opt.AudioSampleRate;
-
-            // profile: ưu tiên LC; nếu ffprobe không điền profile thì bỏ qua
-            var profileOk = string.IsNullOrWhiteSpace(info.Profile)
-                            || info.Profile!.Contains("LC", StringComparison.OrdinalIgnoreCase);
-
-            return (codecOk && chOk && rateOk && profileOk)
-                ? AudioCompliance.Compliant
-                : AudioCompliance.NonCompliant;
+            var args = $"-i \"{input}\" -map 0:v:0 -map 0:a:0? -sn -dn -c copy -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{output}\"";
+            await RunFfmpegSilentAsync(args, ct);
         }
+
+        private async Task AddSilentAsync(string input, string output, CancellationToken ct)
+        {
+            var args = $"-i \"{input}\" -f lavfi -i anullsrc=r={_opt.AudioSampleRate}:cl=stereo -shortest -map 0:v:0 -map 1:a:0 -sn -dn -c:v copy -c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{output}\"";
+            await RunFfmpegSilentAsync(args, ct);
+        }
+
+        private async Task EncodeAacAsync(string input, string output, AudioInfo info, CancellationToken ct)
+        {
+            var args = $"-i \"{input}\" -map 0:v:0 -map 0:a:0? -sn -dn -c:v copy -c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} -fflags +genpts -avoid_negative_ts make_zero -max_interleave_delta 0 \"{output}\"";
+            await RunFfmpegSilentAsync(args, ct);
+        }
+
+        private async Task RunFfmpegSilentAsync(string args, CancellationToken ct)
+        {
+            if (!args.Contains("-loglevel")) args = "-loglevel error -xerror " + args;
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = _opt.FfmpegPath,
+                Arguments = "-hide_banner -y " + args,
+                WorkingDirectory = _opt.WorkDir,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            p.Exited += (_, __) => tcs.TrySetResult(p.ExitCode);
+
+            if (!p.Start()) throw new InvalidOperationException("Cannot start ffmpeg.");
+            p.BeginOutputReadLine(); p.BeginErrorReadLine();
+
+            using (ct.Register(() => { try { if (!p.HasExited) p.Kill(true); } catch { } }))
+            {
+                var exit = await tcs.Task.ConfigureAwait(false);
+                if (exit != 0) throw new InvalidOperationException($"ffmpeg exited with code {exit}");
+            }
+        }
+
+        // ================= Probe =================
 
         private sealed class AudioInfo
         {
@@ -186,6 +255,65 @@ namespace MergeVideo
             public int? SampleRate { get; init; }
             public string? Profile { get; init; }
             public double? DurationSec { get; init; }
+        }
+
+        private enum AudioCompliance { Compliant, MissingAudio, NonCompliant }
+
+        private AudioCompliance GetCompliance(AudioInfo info)
+        {
+            if (!info.HasAudio) return AudioCompliance.MissingAudio;
+
+            bool codecOk = string.Equals(info.CodecName, _opt.AudioCodec, StringComparison.OrdinalIgnoreCase);
+            bool chOk = info.Channels == _opt.AudioChannels;
+            bool rateOk = info.SampleRate == _opt.AudioSampleRate;
+            bool profileOk = string.IsNullOrWhiteSpace(info.Profile) ||
+                             info.Profile.Contains("LC", StringComparison.OrdinalIgnoreCase);
+
+            return (codecOk && chOk && rateOk && profileOk)
+                ? AudioCompliance.Compliant
+                : AudioCompliance.NonCompliant;
+        }
+
+        private async Task<AudioInfo> ProbeAudioAsync(string path, CancellationToken ct)
+        {
+            var args = "-v error -select_streams a:0 -show_entries stream=codec_type,codec_name,channels,sample_rate,profile:format=duration -of json " + Quote(path);
+            var (exit, stdout, stderr) = await RunToolCaptureAsync(_opt.FfprobePath, args, ct);
+            if (exit != 0 || string.IsNullOrWhiteSpace(stdout))
+                return new AudioInfo { HasAudio = true };
+
+            try
+            {
+                var root = JsonSerializer.Deserialize<FfprobeRoot>(stdout, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                var a = root?.Streams?.FirstOrDefault(s =>
+                    string.Equals(s.CodecType, "audio", StringComparison.OrdinalIgnoreCase));
+
+                if (a == null) return new AudioInfo { HasAudio = false };
+
+                int? sr = null;
+                if (int.TryParse(a.SampleRate, out var srParsed)) sr = srParsed;
+
+                double? dur = null;
+                if (double.TryParse(root?.Format?.Duration, NumberStyles.Any, CultureInfo.InvariantCulture, out var d))
+                    dur = d;
+
+                return new AudioInfo
+                {
+                    HasAudio = true,
+                    CodecName = a.CodecName,
+                    Channels = a.Channels,
+                    SampleRate = sr,
+                    Profile = a.Profile,
+                    DurationSec = dur
+                };
+            }
+            catch
+            {
+                return new AudioInfo { HasAudio = true };
+            }
         }
 
         private sealed class FfprobeRoot
@@ -206,397 +334,13 @@ namespace MergeVideo
             [JsonPropertyName("duration")] public string? Duration { get; set; }
         }
 
-        private async Task<AudioInfo> ProbeAudioAsync(string path, CancellationToken ct)
-        {
-            // Gom show_entries lại cho gọn (không bắt buộc)
-            var args = string.Join(" ", new[]
-            {
-                "-v error",
-                "-select_streams a:0",
-                "-show_entries",
-                "stream=codec_type,codec_name,channels,sample_rate,profile:format=duration",
-                "-of json",
-                Q(path)
-            });
-
-            var (exit, stdout, stderr) = await RunToolCaptureSplitAsync(_opt.FfprobePath, args, _opt.WorkDir, ct);
-
-            if (exit != 0 || string.IsNullOrWhiteSpace(stdout))
-            {
-                _log?.Invoke($"[ffprobe] exit={exit}, stderr={(stderr ?? "").Trim()}");
-                // Không crash: coi như không lấy được info -> buộc normalize
-                return new AudioInfo { HasAudio = true }; // HasAudio=true để rơi vào NonCompliant
-            }
-
-            try
-            {
-                var root = JsonSerializer.Deserialize<FfprobeRoot>(stdout, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-
-                var a = root?.Streams?.FirstOrDefault(s =>
-                    string.Equals(s.CodecType, "audio", StringComparison.OrdinalIgnoreCase));
-
-                if (a == null)
-                {
-                    return new AudioInfo { HasAudio = false };
-                }
-
-                int? sr = null;
-                if (int.TryParse(a.SampleRate, out var srParsed)) sr = srParsed;
-
-                double? dur = null;
-                if (double.TryParse(root?.Format?.Duration,
-                        System.Globalization.NumberStyles.Any,
-                        System.Globalization.CultureInfo.InvariantCulture, out var d))
-                    dur = d;
-
-                return new AudioInfo
-                {
-                    HasAudio = true,
-                    CodecName = a.CodecName,
-                    Channels = a.Channels,
-                    SampleRate = sr,
-                    Profile = a.Profile,
-                    DurationSec = dur
-                };
-            }
-            catch (Exception ex)
-            {
-                // JSON không sạch (do warning ở stderr, ký tự lạ, v.v.) -> log và đánh dấu NonCompliant
-                _log?.Invoke($"[ffprobe-parse] {ex.GetType().Name}: {ex.Message}");
-                if (!string.IsNullOrWhiteSpace(stderr))
-                    _log?.Invoke($"[ffprobe-stderr]\n{stderr.Trim()}");
-                // Bắt normalize thay vì crash
-                return new AudioInfo { HasAudio = true };
-            }
-        }
-
-
-        // =================== Steps ===================
-
-        // Remux copy cho file đã đạt chuẩn (rất nhanh)
-        private async Task RemuxCopyAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
-        {
-            var argsCopy = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append($"-i {Q(input)} ")
-                .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
-                .Append("-c copy ")
-                .Append("-fflags +genpts ")
-                .Append("-avoid_negative_ts make_zero ")
-                .Append("-max_interleave_delta 0 ")
-                .Append(Q(outputNormMkv))
-                .ToString();
-
-            try
-            {
-                await RunFfmpegWithProgressAsync(argsCopy, _opt.WorkDir, $"Remux {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
-            }
-            catch (Exception ex) when (IsInvalidData(ex))
-            {
-                _log?.Invoke($"[Retry] Remux copy failed (InvalidData). Re-encode AUDIO for {Path.GetFileName(input)}");
-                TryDelete(outputNormMkv);
-
-                var argsAac = new StringBuilder()
-                    .Append("-hide_banner -y ")
-                    .Append("-v error -xerror ")                 // fail sớm, log rõ
-                    .Append("-analyzeduration 200M -probesize 200M ")
-                    .Append("-fflags +discardcorrupt+igndts ")   // bỏ gói hỏng, bỏ qua DTS méo
-                    .Append($"-i {Q(input)} ")
-                    .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
-                    .Append("-c:v copy ")
-                    .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
-                    .Append("-fflags +genpts ")
-                    .Append("-avoid_negative_ts make_zero ")
-                    .Append("-max_interleave_delta 0 ")
-                    .Append(Q(outputNormMkv))
-                    .ToString();
-
-                try
-                {
-                    await RunFfmpegWithProgressAsync(argsAac, _opt.WorkDir, $"Re-encode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
-                }
-                catch (Exception ex2) when (IsInvalidData(ex2))
-                {
-                    _log?.Invoke($"[Retry-2] Audio re-encode still failing. Hard transcode V+A for {Path.GetFileName(input)}");
-                    TryDelete(outputNormMkv);
-                    await HardTranscodeAsync(input, outputNormMkv, ct, bar);
-                }
-            }
-        }
-
-        private static void TryDelete(string path)
-        {
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
-        }
-
-        // Encode audio về chuẩn (giữ nguyên video)
-        private async Task NormalizeAudioAsync(string input, string outputNormMkv, AudioInfo info, CancellationToken ct, ConsoleProgressBar? bar)
-        {
-            var args = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append($"-i {Q(input)} ")
-                .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
-                .Append("-c:v copy ")
-                .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
-                .Append("-fflags +genpts ")
-                .Append("-avoid_negative_ts make_zero ")
-                .Append("-max_interleave_delta 0 ")
-                .Append(Q(outputNormMkv))
-                .ToString();
-
-            try
-            {
-                await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Normalize {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
-            }
-            catch (Exception ex) when (IsInvalidData(ex))
-            {
-                _log?.Invoke($"[Retry] Audio normalize failed (InvalidData). Ignore-corrupt and retry: {Path.GetFileName(input)}");
-                TryDelete(outputNormMkv);
-
-                var argsSafe = new StringBuilder()
-                    .Append("-hide_banner -y ")
-                    .Append("-v error -xerror ")
-                    .Append("-analyzeduration 200M -probesize 200M ")
-                    .Append("-fflags +discardcorrupt+igndts ")
-                    .Append($"-i {Q(input)} ")
-                    .Append("-map 0:v:0 -map 0:a:0? -sn -dn ")
-                    .Append("-c:v copy ")
-                    .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
-                    .Append("-fflags +genpts ")
-                    .Append("-avoid_negative_ts make_zero ")
-                    .Append("-max_interleave_delta 0 ")
-                    .Append(Q(outputNormMkv))
-                    .ToString();
-
-                try
-                {
-                    await RunFfmpegWithProgressAsync(argsSafe, _opt.WorkDir, $"Normalize(safe) {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
-                }
-                catch (Exception ex2) when (IsInvalidData(ex2))
-                {
-                    _log?.Invoke($"[Retry-2] Safe normalize still failing. Hard transcode V+A for {Path.GetFileName(input)}");
-                    TryDelete(outputNormMkv);
-                    await HardTranscodeAsync(input, outputNormMkv, ct, bar);
-                }
-            }
-        }
-
-        // Trường hợp thiếu audio: thêm silent AAC chuẩn, bám theo độ dài video (-shortest)
-        private async Task NormalizeAddSilentAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
-        {
-            var args = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append($"-i {Q(input)} ")
-                .Append($"-f lavfi -i anullsrc=r={_opt.AudioSampleRate}:cl=stereo ")
-                .Append("-shortest ")
-                .Append("-map 0:v:0 -map 1:a:0 -sn -dn ")
-                .Append("-c:v copy ")
-                .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
-                .Append("-fflags +genpts ")
-                .Append("-avoid_negative_ts make_zero ")
-                .Append("-max_interleave_delta 0 ")
-                .Append(Q(outputNormMkv))
-                .ToString();
-
-            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Add silent {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
-        }
-
-        // Concat sau khi tất cả .norm.mkv đã đồng bộ → copy cả audio & video
-        private async Task ConcatCopyAsync(string videosTxtPath, string outputMkv, CancellationToken ct, ConsoleProgressBar? bar)
-        {
-            var args = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append("-f concat -safe 0 ")
-                .Append($"-i {Q(videosTxtPath)} ")
-                .Append("-map 0:v:0 -map 0:a:0? ")
-                .Append("-c:v copy -c:a copy ")
-                .Append("-fflags +genpts ")
-                .Append("-avoid_negative_ts make_zero ")
-                .Append("-max_interleave_delta 0 ")
-                .Append(Q(outputMkv))
-                .ToString();
-
-            // tổng thời lượng = tổng duration các file trong videos.txt
-            double total = 0;
-            foreach (var f in ReadConcatList(videosTxtPath))
-                total += (await TryGetDurationSecondsAsync(f, ct)) ?? 0;
-
-            var exit = await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Concat → {Path.GetFileName(outputMkv)}", total, ct, reuseBar: bar);
-
-            if (exit != 0)
-                throw new InvalidOperationException($"ffmpeg concat failed (exit={exit}).");
-        }
-
-        private async Task SplitAsync(string inputMkv, string outputPattern, int segmentTimeSeconds, CancellationToken ct)
-        {
-            var args = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append($"-i {Q(inputMkv)} ")
-                .Append("-map 0 ")
-                .Append("-c copy ")
-                .Append("-f segment ")
-                .Append($"-segment_time {segmentTimeSeconds} ")
-                .Append("-reset_timestamps 1 ")
-                .Append(Q(outputPattern))
-                .ToString();
-
-            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Split {Path.GetFileName(inputMkv)}", await TryGetDurationSecondsAsync(inputMkv, ct), ct);
-        }
-
-        // =================== Process helpers ===================
-
-        // Parse "time=HH:MM:SS.mmm" hoặc "time=MM:SS.mmm" từ log ffmpeg → giây
-        private static double? TryParseFfmpegTimeSeconds(string line)
-        {
-            var m = Regex.Match(line, @"time\s*=\s*(?<t>(?:\d{2}:)?\d{2}:\d{2}(?:[.,]\d{1,3})?)");
-            if (!m.Success) return null;
-            var t = m.Groups["t"].Value.Replace(',', '.');
-
-            // hh:mm:ss.fff hoặc mm:ss.fff
-            if (TimeSpan.TryParseExact(t, new[] { @"hh\:mm\:ss\.fff", @"mm\:ss\.fff", @"hh\:mm\:ss" },
-                                       CultureInfo.InvariantCulture, out var ts))
-                return ts.TotalSeconds;
-            return null;
-        }
-
-        // Lấy duration (giây) bằng ffprobe; trả về null nếu lỗi
-        private async Task<double?> TryGetDurationSecondsAsync(string path, CancellationToken ct)
-        {
-            var args = $"-v error -show_entries format=duration -of default=nk=1:nw=1 {Q(path)}";
-            var (exit, stdout, _stderr) = await RunToolCaptureSplitAsync(_opt.FfprobePath, args, _opt.WorkDir, ct);
-            if (exit != 0) return null;
-            if (double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var s)) return s;
-            return null;
-        }
-
-        // Chạy ffmpeg với progress bar (nếu biết tổng thời lượng). Log vào work/logs/ffmpeg-log.txt
-        // AudioSafeConcatManager.cs
-        private async Task<int> RunFfmpegWithProgressAsync(
-            string arguments, string workingDir, string label, double? totalSeconds,
-            CancellationToken ct, ConsoleProgressBar? reuseBar = null)
-        {
-            if (!arguments.Contains("-loglevel"))
-                arguments = "-loglevel error -xerror " + arguments;
-
-            if (!arguments.Contains("-progress"))
-                arguments = "-nostats -progress pipe:2 " + arguments;
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = _opt.FfmpegPath,
-                Arguments = arguments,
-                WorkingDirectory = workingDir,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
-                CreateNoWindow = true
-            };
-
-            var bar = reuseBar ?? new ConsoleProgressBar(label);
-            try
-            {
-                double tot = totalSeconds.GetValueOrDefault(0);
-                double? Parser(string line)
-                {
-                    if (tot <= 0) return null;
-
-                    if (line.StartsWith("out_time_ms=") &&
-                        long.TryParse(line.AsSpan("out_time_ms=".Length), out var us))
-                    return Math.Clamp((us / 1_000_000.0) / tot, 0, 1);
-
-                    if (line.StartsWith("out_time=") &&
-                        TimeSpan.TryParse(line.Substring("out_time=".Length).Trim(),
-                        CultureInfo.InvariantCulture, out var ts))
-                    return Math.Clamp(ts.TotalSeconds / tot, 0, 1);
-
-                    var cur = TryParseFfmpegTimeSeconds(line);
-                    return cur.HasValue ? Math.Clamp(cur.Value / tot, 0.0, 1.0) : (double?)null;
-                }
-
-                string logsRoot = _opt.WorkDir;
-                int exit = await Task.Run(() =>
-                    ConsoleProgressBar.RunProcessWithProgress(psi, Parser, logsRoot, label, onLine: null, bar: bar), ct);
-
-                return exit;
-            }
-            finally
-            {
-                if (reuseBar == null) bar.Dispose(); // chỉ dispose nếu là bar tạm
-            }
-        }
-
-        // Đọc danh sách file từ videos.txt (format: file 'C:\path\xxx.mkv')
-        private static IEnumerable<string> ReadConcatList(string videosTxtPath)
-        {
-            foreach (var raw in File.ReadAllLines(videosTxtPath))
-            {
-                var line = raw.Trim();
-                if (!line.StartsWith("file", StringComparison.OrdinalIgnoreCase)) continue;
-                var i1 = line.IndexOf('\''); var i2 = line.LastIndexOf('\'');
-                if (i1 >= 0 && i2 > i1) yield return line.Substring(i1 + 1, i2 - i1 - 1).Replace("''", "'");
-            }
-        }
-
-        private async Task<int> RunFfmpegAsync(string arguments, string workingDir, string? contextInput, CancellationToken ct)
-        {
-            // đảm bảo dừng ngay khi lỗi + log ngắn gọn chỉ mức error
-            if (!arguments.Contains("-loglevel"))
-                arguments = "-loglevel error -xerror " + arguments;
-
-            var cmdShown = $"{_opt.FfmpegPath} {arguments}";
-            _log?.Invoke($"[FFmpeg] {cmdShown}");
-
-            var (code, _so, se) = await RunToolCaptureSplitAsync(_opt.FfmpegPath, arguments, workingDir, ct);
-
-            if (code != 0)
-            {
-                var baseName = contextInput != null ? Path.GetFileName(contextInput) : "unknown";
-                var logPath = Path.Combine(workingDir, $"ffmpeg-error-{baseName}.log");
-                try
-                {
-                    File.WriteAllText(logPath,
-                        $"CMD : {cmdShown}{Environment.NewLine}" +
-                        $"INPUT: {contextInput}{Environment.NewLine}" +
-                        $"EXIT: {code} ({MapFfmpegExitCode(code)}){Environment.NewLine}{Environment.NewLine}" +
-                        se, new UTF8Encoding(false));
-                }
-                catch { /* best effort */ }
-
-                // ném exception có kèm vài dòng đầu của stderr để hiện lên console
-                var firstLines = string.Join(Environment.NewLine,
-                    (se ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Take(12));
-                throw new InvalidOperationException(
-                    $"{_opt.FfmpegPath} exited with code {code} ({MapFfmpegExitCode(code)}). File: {baseName}. See: {logPath}\n{firstLines}");
-            }
-            return 0;
-        }
-
-        // Map một số mã hay gặp sang tên + mô tả chính thức
-        private static string MapFfmpegExitCode(int code)
-        {
-            return code switch
-            {
-                -1094995529 => "AVERROR_INVALIDDATA – Invalid data found when processing input", // :contentReference[oaicite:3]{index=3}
-                -541478725 => "AVERROR_EOF – End of file",                                     // :contentReference[oaicite:4]{index=4}
-                -22 => "AVERROR(EINVAL) – Invalid argument",
-                -2 => "AVERROR(ENOENT) – No such file or directory",
-                -13 => "AVERROR(EACCES) – Permission denied",
-                -12 => "AVERROR(ENOMEM) – Out of memory",
-                _ => "Unknown AVERROR (see stderr)"
-            };
-        }
-
-
-        private async Task<(int exitCode, string stdout, string stderr)> RunToolCaptureSplitAsync(string fileName, string arguments, string workingDir, CancellationToken ct)
+        private async Task<(int exit, string stdout, string stderr)> RunToolCaptureAsync(string exe, string args, CancellationToken ct)
         {
             var psi = new ProcessStartInfo
             {
-                FileName = fileName,
-                Arguments = arguments,
-                WorkingDirectory = workingDir,
+                FileName = exe,
+                Arguments = args,
+                WorkingDirectory = _opt.WorkDir,
                 UseShellExecute = false,
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
@@ -605,57 +349,77 @@ namespace MergeVideo
 
             using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
             var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var sbOut = new StringBuilder(); var sbErr = new StringBuilder();
+            var so = new StringBuilder(); var se = new StringBuilder();
 
-            p.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) sbOut.AppendLine(e.Data); };
-            p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) sbErr.AppendLine(e.Data); };
+            p.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) so.AppendLine(e.Data); };
+            p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) se.AppendLine(e.Data); };
             p.Exited += (_, __) => tcs.TrySetResult(p.ExitCode);
 
-            if (!p.Start()) throw new InvalidOperationException($"Cannot start {fileName}.");
+            if (!p.Start()) throw new InvalidOperationException($"Cannot start {exe}");
             p.BeginOutputReadLine(); p.BeginErrorReadLine();
 
             using (ct.Register(() => { try { if (!p.HasExited) p.Kill(true); } catch { } }))
             {
                 var exit = await tcs.Task.ConfigureAwait(false);
-                return (exit, sbOut.ToString(), sbErr.ToString());
+                return (exit, so.ToString(), se.ToString());
             }
         }
 
-        private void WriteConcatList(IEnumerable<string> files, string videosTxtPath)
+        // ================= Concat grouping =================
+
+        private sealed record PartSpec(int Index, string OutputName, string OutputPath, IReadOnlyList<string> Inputs, double TotalDurationSec);
+
+        private List<PartSpec> BuildGroups(List<string> normFiles, double maxHours)
         {
-            var sb = new StringBuilder();
-            foreach (var f in files)
+            double maxSec = maxHours * 3600.0;
+            var parts = new List<PartSpec>();
+            var cur = new List<string>();
+            double curSec = 0;
+            int idx = 1;
+
+            foreach (var f in normFiles)
             {
-                var p = f.Replace("'", "''");
-                sb.Append("file '").Append(p).AppendLine("'");
+                var dur = GetDurationSafe(f);
+                if (cur.Count > 0 && (curSec + dur) > maxSec)
+                {
+                    parts.Add(MakePart(idx++, cur, curSec));
+                    cur = new List<string>();
+                    curSec = 0;
+                }
+                cur.Add(f);
+                curSec += dur;
             }
-            File.WriteAllText(videosTxtPath, sb.ToString(), new UTF8Encoding(false));
-            _log?.Invoke($"[ConcatList] {videosTxtPath}");
+            if (cur.Count > 0) parts.Add(MakePart(idx++, cur, curSec));
+            return parts;
         }
 
-        private static string Q(string p) => $"\"{p}\"";
-
-        private async Task HardTranscodeAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
+        private PartSpec MakePart(int index, List<string> inputs, double totalSec)
         {
-            var args = new StringBuilder()
-                .Append("-hide_banner -y ")
-                .Append("-v error -xerror ")
-                .Append("-analyzeduration 400M -probesize 400M ")
-                .Append("-fflags +discardcorrupt+igndts+genpts ")
-                .Append($"-i {Q(input)} ")
-                .Append("-sn -dn ")
-                .Append("-map 0:v:0 -map 0:a:0? ")
-                .Append("-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p ")
-                .Append($"-c:a {_opt.AudioCodec} -b:a {_opt.AudioBitrateKbps}k -ar {_opt.AudioSampleRate} -ac {_opt.AudioChannels} ")
-                .Append("-shortest ")
-                .Append(Q(outputNormMkv))
-                .ToString();
-
-            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Hard transcode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
+            var name = (_opt.OutputBaseName) + (index == 1 && totalSec < _opt.MaxPartHours * 3600.0 ? $" - Part {index:00}.mkv" : $" - Part {index:00}.mkv");
+            var path = Path.Combine(_opt.WorkDir, name);
+            return new PartSpec(index, name, path, inputs, totalSec);
         }
 
+        private double GetDurationSafe(string f)
+        {
+            try
+            {
+                var (exit, stdout, _) = RunToolCaptureAsync(_opt.FfprobePath,
+                    $"-v error -show_entries format=duration -of default=nk=1:nw=1 \"{f}\"", CancellationToken.None)
+                    .GetAwaiter().GetResult();
 
-        private static bool IsInvalidData(Exception ex)
-            => ex is InvalidOperationException ioe && ioe.Message.Contains("exited with code -1094995529"); // AVERROR_INVALIDDATA
+                if (exit == 0 && double.TryParse(stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
+                    return s;
+            }
+            catch { }
+            return 0;
+        }
+
+        private static void TryDeleteQuiet(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+
+        private static string Quote(string p) => $"\"{p}\"";
     }
 }

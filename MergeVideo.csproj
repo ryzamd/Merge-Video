@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="EPPlus" Version="8.1.0" />
+    <PackageReference Include="Spectre.Console" Version="0.51.1" />
   </ItemGroup>
 
 </Project>
