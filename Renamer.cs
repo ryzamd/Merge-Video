@@ -110,7 +110,7 @@ namespace MergeVideo
 
                     processed++;
                     if (totalVideos > 0)
-                        bar.Report((double)processed / totalVideos, $"{newStem} {Path.GetFileName(v)}");
+                        bar.Report((double)processed / totalVideos);
                 }
 
                 foreach (var other in files.Where(f => !Utils.IsVideo(f) && !Utils.IsSubtitle(f)))
@@ -137,7 +137,7 @@ namespace MergeVideo
                 File.WriteAllText(csv, sb.ToString(), new UTF8Encoding(false));
             }
 
-            bar.Done("Renamed all");
+            bar.Done();
             state.RenameCompleted = true;
         }
 

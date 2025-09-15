@@ -98,32 +98,31 @@ namespace MergeVideo
                 {
                     var dst = Path.Combine(normDir, Path.GetFileNameWithoutExtension(src) + ".norm.mkv");
                     var info = await ProbeAudioAsync(src, ct);
+                    var baseName = Path.GetFileName(src);
+                    using var bar = new ConsoleProgressBar($"Normalize {baseName}");
 
                     if (!_opt.SelectiveNormalize)
                     {
                         // luôn encode audio (bản cũ)
-                        await NormalizeAudioAsync(src, dst, info, ct);
+                        await NormalizeAudioAsync(src, dst, info, ct, bar);
                     }
                     else
                     {
                         switch (GetCompliance(info))
                         {
                             case AudioCompliance.Compliant:
-                                // remux copy cực nhanh sang mkv
-                                await RemuxCopyAsync(src, dst, ct);
-                                _log?.Invoke($"[OK] {Path.GetFileName(src)} already compliant → remux copy.");
+                                await RemuxCopyAsync(src, dst, ct, bar);
+                                _log?.Invoke($"[OK] {baseName} already compliant → remux copy.");
                                 break;
 
                             case AudioCompliance.MissingAudio:
-                                // Thêm silent audio đúng chuẩn
-                                await NormalizeAddSilentAsync(src, dst, ct);
-                                _log?.Invoke($"[Fix] {Path.GetFileName(src)} has NO audio → add silent AAC.");
+                                await NormalizeAddSilentAsync(src, dst, ct, bar);
+                                _log?.Invoke($"[Fix] {baseName} has NO audio → add silent AAC.");
                                 break;
 
                             default:
-                                // Encode audio về chuẩn
-                                await NormalizeAudioAsync(src, dst, info, ct);
-                                _log?.Invoke($"[Fix] {Path.GetFileName(src)} non-compliant → re-encode AAC.");
+                                await NormalizeAudioAsync(src, dst, info, ct, bar);
+                                _log?.Invoke($"[Fix] {baseName} non-compliant → re-encode AAC.");
                                 break;
                         }
                     }
@@ -140,8 +139,10 @@ namespace MergeVideo
             WriteConcatList(normalized.OrderBy(n => n, StringComparer.CurrentCultureIgnoreCase), videosTxt);
 
             // 3) Concat: copy cả video và audio (vì mọi .norm.mkv đã đồng bộ)
+            
             var finalMkv = Path.Combine(_opt.WorkDir, _opt.OutputFileName);
-            await ConcatCopyAsync(videosTxt, finalMkv, ct);
+            using var bar = new ConsoleProgressBar($"Final {finalMkv}");
+            await ConcatCopyAsync(videosTxt, finalMkv, ct, bar);
 
             // 4) Optional split
             if (_opt.SegmentTimeSeconds is int seg && seg > 0)
@@ -276,7 +277,7 @@ namespace MergeVideo
         // =================== Steps ===================
 
         // Remux copy cho file đã đạt chuẩn (rất nhanh)
-        private async Task RemuxCopyAsync(string input, string outputNormMkv, CancellationToken ct)
+        private async Task RemuxCopyAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
         {
             var argsCopy = new StringBuilder()
                 .Append("-hide_banner -y ")
@@ -291,7 +292,7 @@ namespace MergeVideo
 
             try
             {
-                await RunFfmpegWithProgressAsync(argsCopy, _opt.WorkDir, $"Remux {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
+                await RunFfmpegWithProgressAsync(argsCopy, _opt.WorkDir, $"Remux {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
             }
             catch (Exception ex) when (IsInvalidData(ex))
             {
@@ -315,13 +316,13 @@ namespace MergeVideo
 
                 try
                 {
-                    await RunFfmpegWithProgressAsync(argsAac, _opt.WorkDir, $"Re-encode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
+                    await RunFfmpegWithProgressAsync(argsAac, _opt.WorkDir, $"Re-encode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
                 }
                 catch (Exception ex2) when (IsInvalidData(ex2))
                 {
                     _log?.Invoke($"[Retry-2] Audio re-encode still failing. Hard transcode V+A for {Path.GetFileName(input)}");
                     TryDelete(outputNormMkv);
-                    await HardTranscodeAsync(input, outputNormMkv, ct);
+                    await HardTranscodeAsync(input, outputNormMkv, ct, bar);
                 }
             }
         }
@@ -332,7 +333,7 @@ namespace MergeVideo
         }
 
         // Encode audio về chuẩn (giữ nguyên video)
-        private async Task NormalizeAudioAsync(string input, string outputNormMkv, AudioInfo info, CancellationToken ct)
+        private async Task NormalizeAudioAsync(string input, string outputNormMkv, AudioInfo info, CancellationToken ct, ConsoleProgressBar? bar)
         {
             var args = new StringBuilder()
                 .Append("-hide_banner -y ")
@@ -348,7 +349,7 @@ namespace MergeVideo
 
             try
             {
-                await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Normalize {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct);
+                await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Normalize {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
             }
             catch (Exception ex) when (IsInvalidData(ex))
             {
@@ -372,19 +373,19 @@ namespace MergeVideo
 
                 try
                 {
-                    await RunFfmpegWithProgressAsync(argsSafe, _opt.WorkDir, $"Normalize(safe) {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct);
+                    await RunFfmpegWithProgressAsync(argsSafe, _opt.WorkDir, $"Normalize(safe) {Path.GetFileName(input)}", info?.DurationSec ?? await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
                 }
                 catch (Exception ex2) when (IsInvalidData(ex2))
                 {
                     _log?.Invoke($"[Retry-2] Safe normalize still failing. Hard transcode V+A for {Path.GetFileName(input)}");
                     TryDelete(outputNormMkv);
-                    await HardTranscodeAsync(input, outputNormMkv, ct);
+                    await HardTranscodeAsync(input, outputNormMkv, ct, bar);
                 }
             }
         }
 
         // Trường hợp thiếu audio: thêm silent AAC chuẩn, bám theo độ dài video (-shortest)
-        private async Task NormalizeAddSilentAsync(string input, string outputNormMkv, CancellationToken ct)
+        private async Task NormalizeAddSilentAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
         {
             var args = new StringBuilder()
                 .Append("-hide_banner -y ")
@@ -400,11 +401,11 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Add silent {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
+            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Add silent {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
         }
 
         // Concat sau khi tất cả .norm.mkv đã đồng bộ → copy cả audio & video
-        private async Task ConcatCopyAsync(string videosTxtPath, string outputMkv, CancellationToken ct)
+        private async Task ConcatCopyAsync(string videosTxtPath, string outputMkv, CancellationToken ct, ConsoleProgressBar? bar)
         {
             var args = new StringBuilder()
                 .Append("-hide_banner -y ")
@@ -423,7 +424,7 @@ namespace MergeVideo
             foreach (var f in ReadConcatList(videosTxtPath))
                 total += (await TryGetDurationSecondsAsync(f, ct)) ?? 0;
 
-            var exit = await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Concat → {Path.GetFileName(outputMkv)}", total, ct);
+            var exit = await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Concat → {Path.GetFileName(outputMkv)}", total, ct, reuseBar: bar);
 
             if (exit != 0)
                 throw new InvalidOperationException($"ffmpeg concat failed (exit={exit}).");
@@ -442,7 +443,7 @@ namespace MergeVideo
                 .Append(Q(outputPattern))
                 .ToString();
 
-            await RunFfmpegAsync(args, _opt.WorkDir, inputMkv, ct);
+            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Split {Path.GetFileName(inputMkv)}", await TryGetDurationSecondsAsync(inputMkv, ct), ct);
         }
 
         // =================== Process helpers ===================
@@ -472,11 +473,16 @@ namespace MergeVideo
         }
 
         // Chạy ffmpeg với progress bar (nếu biết tổng thời lượng). Log vào work/logs/ffmpeg-log.txt
+        // AudioSafeConcatManager.cs
         private async Task<int> RunFfmpegWithProgressAsync(
-            string arguments, string workingDir, string label, double? totalSeconds, CancellationToken ct)
+            string arguments, string workingDir, string label, double? totalSeconds,
+            CancellationToken ct, ConsoleProgressBar? reuseBar = null)
         {
             if (!arguments.Contains("-loglevel"))
                 arguments = "-loglevel error -xerror " + arguments;
+
+            if (!arguments.Contains("-progress"))
+                arguments = "-nostats -progress pipe:2 " + arguments;
 
             var psi = new ProcessStartInfo
             {
@@ -489,23 +495,37 @@ namespace MergeVideo
                 CreateNoWindow = true
             };
 
-            var work = WorkDirs.Prepare(_opt.WorkDir); // để ConsoleProgressBar biết logsDir
-            using var bar = new ConsoleProgressBar(label);
-            bar.Report(0, "Starting");
-
-            double tot = totalSeconds.GetValueOrDefault(0);
-            double? Parser(string line)
+            var bar = reuseBar ?? new ConsoleProgressBar(label);
+            try
             {
-                if (tot <= 0) return null;           // không có tổng → chỉ hiện spinner
-                var cur = TryParseFfmpegTimeSeconds(line);
-                return cur.HasValue ? Math.Min(1.0, Math.Max(0.0, cur.Value / tot)) : (double?)null;
+                double tot = totalSeconds.GetValueOrDefault(0);
+                double? Parser(string line)
+                {
+                    if (tot <= 0) return null;
+
+                    if (line.StartsWith("out_time_ms=") &&
+                        long.TryParse(line.AsSpan("out_time_ms=".Length), out var us))
+                    return Math.Clamp((us / 1_000_000.0) / tot, 0, 1);
+
+                    if (line.StartsWith("out_time=") &&
+                        TimeSpan.TryParse(line.Substring("out_time=".Length).Trim(),
+                        CultureInfo.InvariantCulture, out var ts))
+                    return Math.Clamp(ts.TotalSeconds / tot, 0, 1);
+
+                    var cur = TryParseFfmpegTimeSeconds(line);
+                    return cur.HasValue ? Math.Clamp(cur.Value / tot, 0.0, 1.0) : (double?)null;
+                }
+
+                string logsRoot = _opt.WorkDir;
+                int exit = await Task.Run(() =>
+                    ConsoleProgressBar.RunProcessWithProgress(psi, Parser, logsRoot, label, onLine: null, bar: bar), ct);
+
+                return exit;
             }
-
-            // chạy đồng bộ trong task để tương thích async
-            int exit = await Task.Run(() =>
-                ConsoleProgressBar.RunProcessWithProgress(psi, Parser, work, onLine: null, bar: bar), ct);
-
-            return exit;
+            finally
+            {
+                if (reuseBar == null) bar.Dispose(); // chỉ dispose nếu là bar tạm
+            }
         }
 
         // Đọc danh sách file từ videos.txt (format: file 'C:\path\xxx.mkv')
@@ -615,7 +635,7 @@ namespace MergeVideo
 
         private static string Q(string p) => $"\"{p}\"";
 
-        private async Task HardTranscodeAsync(string input, string outputNormMkv, CancellationToken ct)
+        private async Task HardTranscodeAsync(string input, string outputNormMkv, CancellationToken ct, ConsoleProgressBar? bar)
         {
             var args = new StringBuilder()
                 .Append("-hide_banner -y ")
@@ -631,7 +651,7 @@ namespace MergeVideo
                 .Append(Q(outputNormMkv))
                 .ToString();
 
-            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Hard transcode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct);
+            await RunFfmpegWithProgressAsync(args, _opt.WorkDir, $"Hard transcode {Path.GetFileName(input)}", await TryGetDurationSecondsAsync(input, ct), ct, reuseBar: bar);
         }
 
 

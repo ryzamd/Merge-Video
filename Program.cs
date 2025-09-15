@@ -8,6 +8,7 @@
 using MergeVideo.Models;
 using MergeVideo.Utilities;
 using OfficeOpenXml; // EPPlus
+using System.Runtime.CompilerServices;
 using System.Text;
 using static MergeVideo.Enums.OnMissingSubtitleModeContainer;
 
@@ -103,14 +104,14 @@ namespace MergeVideo
             File.WriteAllText(Path.Combine(work.PathDir, "parent_folder.txt"), parentFolder, new UTF8Encoding(false));
 
             // 1) SCAN + RENAME
-            Console.WriteLine("[1/5] Scanning sub-folders & renaming files...");
+            Console.WriteLine("[1/4] Scanning sub-folders & renaming files...");
             var renameState = new RenameState();
             var renamer = new Renamer(cfg, work, logger, excel, opts);
             renamer.ScanAndRenameIfNeeded(parentFolder, renameState);
 
             // 2) CONCAT VIDEOS (audio-safe) + ưu tiên cache norm nếu có đủ
             var parentName = Path.GetFileName(parentFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            Console.WriteLine("[2/5] Concatenating videos (audio-safe) ...");
+            Console.WriteLine("[2/4] Concatenating videos (audio-safe) ...");
 
             // Lấy danh sách clip gốc trong work/videos theo đúng thứ tự số
             var inputsOriginal = Directory.EnumerateFiles(work.VideosDir)
@@ -207,7 +208,7 @@ namespace MergeVideo
                 if (useNorm)
                 {
                     // Dùng concat demuxer (-c copy) → không re-encode
-                    var exit = Utils.FfmpegConcatCopy(group, outputPath, cfg.FfmpegPath, msg => Console.WriteLine(msg));
+                    var exit = Utils.FfmpegConcatCopy(group, outputPath, cfg.FfmpegPath, log: null);
                     if (exit != 0)
                     {
                         logger.Error($"ffmpeg concat copy failed for {outputFileName} (exit={exit}).");
@@ -217,6 +218,7 @@ namespace MergeVideo
                 else
                 {
                     // Chuẩn hoá & concat theo pipeline hiện có
+                    ConsoleProgressBar.ResetRegion();
                     var opt = new AudioSafeConcatManager.Options(
                         workDir: work.Root,
                         outputFileName: outputFileName,
@@ -229,8 +231,9 @@ namespace MergeVideo
                         audioSampleRate: 48000,
                         selectiveNormalize: true
                     );
-                    var manager = new AudioSafeConcatManager(opt, msg => Console.WriteLine(msg));
+                    var manager = new AudioSafeConcatManager(opt, logger: null);
                     manager.RunAsync(group).GetAwaiter().GetResult();
+                    ConsoleProgressBar.ResetRegion();
                 }
 
                 partNumber++;
