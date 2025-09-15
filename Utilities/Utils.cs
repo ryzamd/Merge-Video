@@ -1,8 +1,8 @@
-﻿using MergeVideo.Models;
+﻿using MergeVideo.Enums;
+using MergeVideo.Models;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace MergeVideo.Utilities
 {
@@ -32,16 +32,9 @@ namespace MergeVideo.Utilities
             => (path.IndexOfAny(new[] { ' ', '(', ')', '&', '\'', '[', ']', '{', '}', ';' }) >= 0)
                ? '"' + path + '"' : path;
 
-        internal static int NumericPrefixOrDefault(string name)
-        {
-            var m = Regex.Match(name, @"^\s*(?<n>\d+)");
-            if (m.Success && int.TryParse(m.Groups["n"].Value, out int n)) return n;
-            return int.MaxValue; // non-number-leading names go to end
-        }
-
         internal static IEnumerable<string> GetSubDirsSorted(string parent)
             => Directory.EnumerateDirectories(parent)
-                .OrderBy(dir => NumericPrefixOrDefault(Path.GetFileName(dir)))
+                .OrderBy(dir => NumericNameComparer.NumericPrefixOrDefault(Path.GetFileName(dir)))
                 .ThenBy(dir => Path.GetFileName(dir), StringComparer.CurrentCultureIgnoreCase);
 
         internal static string GetFfprobeDurationSeconds(Config cfg, string mediaPath)
@@ -165,11 +158,11 @@ namespace MergeVideo.Utilities
 
                 switch (opts.OnMissingSubtitle)
                 {
-                    case MergeVideo.Enums.OnMissingSubtitleModeContainer.OnMissingSubtitleMode.WarnOnly:
+                    case OnMissingSubtitleMode.WarnOnly:
                         logger.Warn(missMsg);
                         break;
 
-                    case MergeVideo.Enums.OnMissingSubtitleModeContainer.OnMissingSubtitleMode.CreateEmptyFile:
+                    case OnMissingSubtitleMode.CreateEmptyFile:
                         foreach (var b in missingBases)
                         {
                             var emptySrt = Path.Combine(subsDir, b + ".srt");
@@ -180,7 +173,7 @@ namespace MergeVideo.Utilities
                         logger.Warn(missMsg + " — created empty .srt placeholders to keep timeline alignment.");
                         break;
 
-                    case MergeVideo.Enums.OnMissingSubtitleModeContainer.OnMissingSubtitleMode.Skip:
+                    case OnMissingSubtitleMode.Skip:
                     default:
                         logger.Warn(missMsg + " — will skip subtitles for those videos.");
                         break;

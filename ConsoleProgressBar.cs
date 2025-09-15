@@ -1,122 +1,97 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
 
 namespace MergeVideo
 {
     sealed class ConsoleProgressBar : IDisposable
     {
-        // ====== Quản lý slot (mỗi bar một slot), vẽ bám "đáy cửa sổ" động ======
-        private static readonly object G = new();
-        private static int _regionTop = -1;           // hàng đầu vùng progress (cố định)
-        private static int _nextOffset = 0;           // next compact row offset
-        private static readonly SortedSet<int> _freeOffsets = new(); // offsets reuse
-        private static int _printedLines = 0;         // số dòng đã "đăt chỗ"
+        // Global state management for all progress bars
+        private static readonly object GlobalLock = new();
+        private static readonly Dictionary<ConsoleProgressBar, BarState> ActiveBars = new();
+        private static int BaseRow = -1;
+        private static Timer? GlobalTimer;
+        private static int MaxRowUsed = -1;
 
-        private static int AcquireOffset()
+        // Individual bar state
+        private class BarState
         {
-            lock (G)
+            public int Row { get; set; }
+            public double Progress { get; set; }
+            public string Label { get; set; }
+            public bool IsDisposed { get; set; }
+            public DateTime LastUpdate { get; set; }
+
+            public BarState(string label, int row)
             {
-                if (_regionTop < 0) _regionTop = Console.CursorTop; // neo 1 lần
-                int off = _freeOffsets.Count > 0 ? _freeOffsets.Min : _nextOffset++;
-                if (_freeOffsets.Count > 0) _freeOffsets.Remove(off);
-
-                // đảm bảo đã "in xuống dòng" đủ để có chỗ vẽ
-                int need = off + 1;
-                while (_printedLines < need)
-                {
-                    try
-                    {
-                        int row = Math.Min(_regionTop + _printedLines,
-                        Math.Max(0, Console.BufferHeight - 1));
-                        Console.SetCursorPosition(0, row);
-                        Console.WriteLine();
-                    }
-                    catch { /* shell resize - bỏ qua */ }
-
-                    _printedLines++;
-                }
-                return off;
+                Label = label;
+                Row = row;
+                Progress = 0;
+                IsDisposed = false;
+                LastUpdate = DateTime.Now;
             }
         }
 
-        private static void ReleaseOffset(int off)
-        {
-            lock (G) { _freeOffsets.Add(off); }
-        }
-
-        // ====== Một thanh ======
-        private readonly object _lock = new();
+        private readonly BarState _state;
         private readonly int _width;
-        private readonly Timer _timer;
-        private double _targetPct = 0;
-        private double _drawnPct = -1;
-        private bool _disposed = false;
-        private readonly int _offset;
-        private int Row => Math.Min(_regionTop + _offset, Math.Max(0, Console.BufferHeight - 1));
+        private bool _disposed;
 
         public ConsoleProgressBar(string label, int width = 40)
         {
-            Label = label;
-            _width = Math.Max(10, width);
-            _offset = AcquireOffset();
-            _timer = new Timer(_ => TickSafe(), null, TimeSpan.Zero, TimeSpan.FromMilliseconds(125));
+            Label = label ?? "Progress";
+            _width = Math.Max(10, Math.Min(width, 60)); // Clamp width
+
+            lock (GlobalLock)
+            {
+                // Initialize base row on first bar
+                if (BaseRow < 0)
+                {
+                    BaseRow = Console.CursorTop;
+                    Console.WriteLine(); // Reserve space
+                }
+
+                // Find next available row
+                int row = 0;
+                while (ActiveBars.Values.Any(b => b.Row == row && !b.IsDisposed))
+                    row++;
+
+                _state = new BarState(label!, row);
+                ActiveBars[this] = _state;
+                MaxRowUsed = Math.Max(MaxRowUsed, row);
+
+                // Ensure we have enough space
+                EnsureConsoleSpace(row);
+
+                // Start global timer if not running
+                if (GlobalTimer == null)
+                {
+                    GlobalTimer = new Timer(_ => UpdateAllBars(), null, 0, 100);
+                }
+            }
         }
 
         public string Label { get; }
 
         public void Report(double pct)
         {
-            if (double.IsNaN(pct) || double.IsInfinity(pct)) pct = 0;
-            pct = Math.Clamp(pct, 0, 1);
-            lock (_lock) _targetPct = pct;
-        }
-
-        private void TickSafe()
-        {
-            try { Tick(); }
-            catch { /* tránh crash nếu console bị resize/đổi buffer giữa chừng */ }
-        }
-
-        private void Tick()
-        {
             if (_disposed) return;
 
-            double pct;
-            lock (_lock) pct = _targetPct;
-            if (pct == _drawnPct) return;
-            _drawnPct = pct;
-
-            int filled = (int)Math.Round(pct * _width);
-            string bar = new string('#', filled) + new string('-', _width - filled);
-            int percent = (int)Math.Round(pct * 100);
-            string text = $"{Label} [{bar}] {percent,3}%";
-
-            int avail = Math.Max(10, Console.BufferWidth - 1);
-            if (text.Length > avail) text = text[..avail];
-            text = text.PadRight(avail);
-
-            lock (G)
+            pct = Math.Clamp(pct, 0, 1);
+            lock (GlobalLock)
             {
-                var (cx, cy) = Console.GetCursorPosition();
-                int row = Row; // hàng cố định
-                try
+                if (_state != null)
                 {
-                    Console.SetCursorPosition(0, row);
-                    Console.Write(text);
+                    _state.Progress = pct;
+                    _state.LastUpdate = DateTime.Now;
                 }
-                catch { /* tránh crash nếu shell đang resize */ }
-                try { Console.SetCursorPosition(cx, cy); } catch { }
             }
         }
 
         public void Done()
         {
             if (_disposed) return;
-            Report(1);
-            TickSafe();
+            Report(1.0);
+            Thread.Sleep(100); // Give timer a chance to render final state
             Dispose();
         }
 
@@ -124,80 +99,229 @@ namespace MergeVideo
         {
             if (_disposed) return;
             _disposed = true;
-            try { _timer?.Dispose(); } catch { }
-            ReleaseOffset(_offset);
+
+            lock (GlobalLock)
+            {
+                if (_state != null)
+                {
+                    _state.IsDisposed = true;
+
+                    // Clear the line
+                    try
+                    {
+                        var (currentLeft, currentTop) = Console.GetCursorPosition();
+                        int targetRow = BaseRow + _state.Row;
+
+                        if (targetRow < Console.BufferHeight)
+                        {
+                            Console.SetCursorPosition(0, targetRow);
+                            Console.Write(new string(' ', Console.BufferWidth - 1));
+                            Console.SetCursorPosition(currentLeft, currentTop);
+                        }
+                    }
+                    catch { /* Ignore console errors */ }
+                }
+
+                ActiveBars.Remove(this);
+
+                // Stop timer if no active bars
+                if (!ActiveBars.Any(kvp => !kvp.Value.IsDisposed))
+                {
+                    GlobalTimer?.Dispose();
+                    GlobalTimer = null;
+                }
+            }
         }
 
-        // ========= Runner FFmpeg: chỉ ghi log khi lỗi =========
+        private static void EnsureConsoleSpace(int row)
+        {
+            try
+            {
+                int neededRow = BaseRow + row + 1;
+                while (Console.CursorTop < neededRow)
+                {
+                    Console.WriteLine();
+                }
+            }
+            catch { /* Ignore console errors */ }
+        }
+
+        private static void UpdateAllBars()
+        {
+            lock (GlobalLock)
+            {
+                if (BaseRow < 0) return;
+
+                var (savedLeft, savedTop) = (0, 0);
+                try
+                {
+                    (savedLeft, savedTop) = Console.GetCursorPosition();
+                }
+                catch { return; }
+
+                foreach (var kvp in ActiveBars.ToList())
+                {
+                    var bar = kvp.Key;
+                    var state = kvp.Value;
+
+                    if (state.IsDisposed) continue;
+
+                    try
+                    {
+                        RenderBar(state, bar._width);
+                    }
+                    catch { /* Ignore render errors */ }
+                }
+
+                try
+                {
+                    Console.SetCursorPosition(savedLeft, savedTop);
+                }
+                catch { /* Ignore positioning errors */ }
+            }
+        }
+
+        private static void RenderBar(BarState state, int barWidth)
+        {
+            int targetRow = BaseRow + state.Row;
+            if (targetRow >= Console.BufferHeight) return;
+
+            // Build progress bar string
+            int filled = (int)Math.Round(state.Progress * barWidth);
+            string bar = new string('█', filled) + new string('░', barWidth - filled);
+            int percent = (int)Math.Round(state.Progress * 100);
+
+            // Truncate label if needed
+            int maxLabelLen = Console.BufferWidth - barWidth - 10; // Reserve space for bar and percentage
+            string label = state.Label;
+            if (label.Length > maxLabelLen && maxLabelLen > 3)
+                label = label.Substring(0, maxLabelLen - 3) + "...";
+
+            string line = $"{label} [{bar}] {percent,3}%";
+
+            // Ensure line fits console width
+            if (line.Length >= Console.BufferWidth)
+                line = line.Substring(0, Console.BufferWidth - 1);
+
+            // Pad to clear any previous content
+            line = line.PadRight(Math.Min(Console.BufferWidth - 1, 120));
+
+            Console.SetCursorPosition(0, targetRow);
+            Console.Write(line);
+        }
+
+        public static void ResetRegion()
+        {
+            lock (GlobalLock)
+            {
+                // Clear all active bars
+                foreach (var bar in ActiveBars.Keys.ToList())
+                {
+                    bar.Dispose();
+                }
+
+                ActiveBars.Clear();
+                BaseRow = -1;
+                MaxRowUsed = -1;
+
+                GlobalTimer?.Dispose();
+                GlobalTimer = null;
+
+                // Move cursor to next line
+                try
+                {
+                    Console.WriteLine();
+                }
+                catch { /* Ignore */ }
+            }
+        }
+
+        // Static runner for FFmpeg with progress tracking
         public static int RunProcessWithProgress(
             ProcessStartInfo psi,
             Func<string, double?> tryParseProgress,
             string logsRootDir,
             string label,
             Action<string>? onLine,
-            ConsoleProgressBar bar)
+            ConsoleProgressBar? bar)
         {
             psi.UseShellExecute = false;
             psi.RedirectStandardError = true;
             psi.RedirectStandardOutput = true;
             psi.CreateNoWindow = true;
 
-            var buf = new StringBuilder(64 * 1024);
-            object gate = new();
+            var outputBuffer = new StringBuilder(64 * 1024);
+            var errorBuffer = new StringBuilder(64 * 1024);
+            object bufferLock = new();
 
-            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            p.OutputDataReceived += (_, e) =>
+            bool ownsBar = false;
+            if (bar == null)
             {
-                if (e.Data == null) return;
-                lock (gate) buf.AppendLine(e.Data);
-                onLine?.Invoke(e.Data);
-            };
-            p.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data == null) return;
-                lock (gate) buf.AppendLine(e.Data);
-                var v = tryParseProgress?.Invoke(e.Data);
-                if (v.HasValue) bar.Report(v.Value);
-            };
-
-            p.Start();
-            p.BeginOutputReadLine();
-            p.BeginErrorReadLine();
-            p.WaitForExit();
-            bar.Done();
-
-            if (p.ExitCode != 0)
-            {
-                try
-                {
-                    var logsDir = System.IO.Path.Combine(logsRootDir, "logs");
-                    System.IO.Directory.CreateDirectory(logsDir);
-                    var safe = Regex.Replace(label ?? "ffmpeg", @"[^A-Za-z0-9_.-]+", "_");
-                    var logPath = System.IO.Path.Combine(
-                        logsDir, $"ffmpeg-error-{DateTime.UtcNow:yyyyMMdd_HHmmssfff}-{safe}.log");
-                    System.IO.File.WriteAllText(logPath, buf.ToString(), new UTF8Encoding(false));
-                }
-                catch { }
+                bar = new ConsoleProgressBar(label);
+                ownsBar = true;
             }
-            return p.ExitCode;
-        }
 
-        // Dùng khi chuyển “pha” (ví dụ sau rename, trước normalize) để dọn vùng cũ
-        public static void ResetRegion()
-        {
-            lock (G)
+            try
             {
-                _regionTop = -1;
-                _nextOffset = 0;
-                _printedLines = 0;
-                _freeOffsets.Clear();
+                using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
 
-                try
+                process.OutputDataReceived += (_, e) =>
                 {
-                    int row = Math.Min(Console.CursorTop + 1,
-                    Math.Max(0, Console.BufferHeight - 1));
-                    Console.SetCursorPosition(0, row);
-                } catch { }
+                    if (e.Data == null) return;
+                    lock (bufferLock) { outputBuffer.AppendLine(e.Data); }
+                    onLine?.Invoke(e.Data);
+                };
+
+                process.ErrorDataReceived += (_, e) =>
+                {
+                    if (e.Data == null) return;
+                    lock (bufferLock) { errorBuffer.AppendLine(e.Data); }
+
+                    var progress = tryParseProgress?.Invoke(e.Data);
+                    if (progress.HasValue)
+                    {
+                        bar.Report(progress.Value);
+                    }
+                };
+
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+
+                bar.Done();
+
+                // Log errors if process failed
+                if (process.ExitCode != 0 && !string.IsNullOrEmpty(logsRootDir))
+                {
+                    try
+                    {
+                        var logsDir = System.IO.Path.Combine(logsRootDir, "logs");
+                        System.IO.Directory.CreateDirectory(logsDir);
+
+                        var safeName = Regex.Replace(label ?? "process", @"[^A-Za-z0-9_.-]+", "_");
+                        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmssfff");
+                        var logPath = System.IO.Path.Combine(logsDir, $"error-{safeName}-{timestamp}.log");
+
+                        string logContent;
+                        lock (bufferLock)
+                        {
+                            logContent = $"Exit Code: {process.ExitCode}\n\n" +
+                                        $"=== STDOUT ===\n{outputBuffer}\n\n" +
+                                        $"=== STDERR ===\n{errorBuffer}";
+                        }
+
+                        System.IO.File.WriteAllText(logPath, logContent, new UTF8Encoding(false));
+                    }
+                    catch { /* Best effort logging */ }
+                }
+
+                return process.ExitCode;
+            }
+            finally
+            {
+                if (ownsBar)
+                    bar.Dispose();
             }
         }
     }

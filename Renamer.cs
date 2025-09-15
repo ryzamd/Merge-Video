@@ -1,9 +1,9 @@
-﻿using MergeVideo.Models;
+﻿using MergeVideo.Enums;
+using MergeVideo.Models;
 using MergeVideo.Utilities;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
-using static MergeVideo.Enums.OnMissingSubtitleModeContainer;
 
 namespace MergeVideo
 {
@@ -56,11 +56,11 @@ namespace MergeVideo
                 var files = Directory.EnumerateFiles(sub, "*", SearchOption.TopDirectoryOnly).ToList();
 
                 var videos = files.Where(Utils.IsVideo)
-                    .OrderBy(p => Utils.NumericPrefixOrDefault(Path.GetFileName(p)!))
+                    .OrderBy(p => NumericNameComparer.NumericPrefixOrDefault(Path.GetFileName(p)!))
                     .ThenBy(p => Path.GetFileName(p), StringComparer.CurrentCultureIgnoreCase)
                     .ToList();
                 var subs = files.Where(Utils.IsSubtitle)
-                    .OrderBy(p => Utils.NumericPrefixOrDefault(Path.GetFileName(p)!))
+                    .OrderBy(p => NumericNameComparer.NumericPrefixOrDefault(Path.GetFileName(p)!))
                     .ThenBy(p => Path.GetFileName(p), StringComparer.CurrentCultureIgnoreCase)
                     .ToList();
 
@@ -147,7 +147,7 @@ namespace MergeVideo
             var subsByNum = new Dictionary<int, List<string>>();
             foreach (var s in subs)
             {
-                var num = Utils.NumericPrefixOrDefault(Path.GetFileName(s)!);
+                var num = NumericNameComparer.NumericPrefixOrDefault(Path.GetFileName(s)!);
                 if (!subsByNum.TryGetValue(num, out var list)) { list = new List<string>(); subsByNum[num] = list; }
                 list.Add(s);
             }
@@ -155,7 +155,7 @@ namespace MergeVideo
             var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var v in videos)
             {
-                var vn = Utils.NumericPrefixOrDefault(Path.GetFileName(v)!);
+                var vn = NumericNameComparer.NumericPrefixOrDefault(Path.GetFileName(v)!);
                 if (subsByNum.TryGetValue(vn, out var cand))
                 {
                     var s = cand.FirstOrDefault(x => !used.Contains(x));

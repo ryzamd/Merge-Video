@@ -1,9 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+﻿using OfficeOpenXml;
 using System.Text;
-using OfficeOpenXml;
 
 namespace MergeVideo
 {
@@ -56,29 +52,6 @@ namespace MergeVideo
                 string tsStr = ts.TotalHours >= 1 ? $"{(int)ts.TotalHours:00}:{ts.Minutes:00}:{ts.Seconds:00}" : $"{ts.Minutes:00}:{ts.Seconds:00}";
                 sw.WriteLine($"{tsStr} | {originalNames[i]}");
                 acc += dur;
-            }
-        }
-
-        // So sánh tên file dạng số thứ tự (001, 002, ...)
-        private class NumericNameComparer : IComparer<string>
-        {
-            public int Compare(string? x, string? y)
-            {
-                if (x == null && y == null) return 0;
-                if (x == null) return -1;
-                if (y == null) return 1;
-                int nx = NumericPrefixOrDefault(Path.GetFileName(x)!);
-                int ny = NumericPrefixOrDefault(Path.GetFileName(y)!);
-                int cmp = nx.CompareTo(ny);
-                if (cmp != 0) return cmp;
-                return StringComparer.CurrentCultureIgnoreCase.Compare(x, y);
-            }
-
-            private static int NumericPrefixOrDefault(string name)
-            {
-                var m = System.Text.RegularExpressions.Regex.Match(name, @"^\s*(?<n>\d+)");
-                if (m.Success && int.TryParse(m.Groups["n"].Value, out int n)) return n;
-                return int.MaxValue;
             }
         }
     }

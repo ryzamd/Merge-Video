@@ -1,7 +1,9 @@
 ﻿namespace MergeVideo.Enums
 {
-    class OnMissingSubtitleModeContainer
+    public enum OnMissingSubtitleMode
     {
-        public enum OnMissingSubtitleMode { Skip, WarnOnly, CreateEmptyFile }
+        Skip,
+        WarnOnly,
+        CreateEmptyFile
     }
 }
